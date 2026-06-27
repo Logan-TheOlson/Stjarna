@@ -101,6 +101,7 @@ bool VulkanContext::Init(SDL_Window* window) {
     chk(vkCreateSemaphore(device, &semCI, nullptr, &acquireSem));
     chk(vkCreateSemaphore(device, &semCI, nullptr, &renderSem));
     chk(vkCreateFence(device, &fenceCI, nullptr, &fence));
+    circles.reserve(1024);
     return true;
 }
 
@@ -203,7 +204,7 @@ void VulkanContext::RenderFrame() {
 
     uint32_t imageIndex = 0;
     VkResult acq = vkAcquireNextImageKHR(device, swapchain, UINT64_MAX, acquireSem, VK_NULL_HANDLE, &imageIndex);
-    if (acq == VK_ERROR_OUT_OF_DATE_KHR) { RecreateSwapchain(); return; }
+    if (acq == VK_ERROR_OUT_OF_DATE_KHR) { RecreateSwapchain(); circles.clear(); return; }
     if (acq != VK_SUCCESS && acq != VK_SUBOPTIMAL_KHR) chk(acq);
 
     chk(vkResetFences(device, 1, &fence));

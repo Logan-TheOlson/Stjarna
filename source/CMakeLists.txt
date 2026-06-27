@@ -43,7 +43,9 @@ add_executable(${NAME}
     app/Window.cpp
     app/VulkanContext.cpp
     resource.rc
-    Stjarna.manifest)
+    Stjarna.manifest
+        physics/collision_Engine.cpp
+        physics/collision_Engine.h)
 
 target_compile_definitions(${NAME} PRIVATE VK_NO_PROTOTYPES)
 if (WIN32)

@@ -9,6 +9,10 @@ public:
     void RenderFrame();
     void Shutdown();
     void AddCircle(float cx, float cy, float radius, Color color);
+    int   Width()      const;
+    int   Height()     const;
+    float HalfWidth()  const;
+    float HalfHeight() const;
 
 private:
     Window        window;

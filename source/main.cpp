@@ -1,19 +1,26 @@
 #include "app/App.h"
 #include "Circle.h"
+#include "physics/collision_Engine.h"
+#include "Config.h"
 
 App app;
 
 Circle ball;
-float vy = 0;
 
 void Init() {
-    ball = Circle(0, 0, 10, { 1.0f, 0.5f, 0.1f, 1.0f });
+    ball = Circle(Config::Defaults::CirclePos.x, Config::Defaults::CirclePos.y,
+                  Config::Defaults::CircleRadius, Config::Defaults::CircleColor);
 }
 
 void Update() {
-    vy -= 0.01f;
-    ball.y += vy;
-    ball.Draw();
+
+    ball.vy -= 0.25f;
+    ball.x  += ball.vx;
+    ball.y  += ball.vy;
+
+    CollisionEngine::ResolveBoundary(ball, app.HalfWidth(), app.HalfHeight());
+
+    ball.Draw(app);
 }
 
 int main(int, char**) {

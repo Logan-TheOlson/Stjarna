@@ -1,10 +1,9 @@
 #pragma once
 #include <volk/volk.h>
 #include <vector>
+#include "../Config.h"
 
 struct SDL_Window;
-
-struct Color { float r, g, b, a; };
 
 class VulkanContext {
 public:
@@ -12,6 +11,10 @@ public:
     void AddCircle(float cx, float cy, float radius, Color color);
     void RenderFrame();
     void Shutdown();
+    int   Width()      const { return (int)swapchainExtent.width; }
+    int   Height()     const { return (int)swapchainExtent.height; }
+    float HalfWidth()  const { return swapchainExtent.width  * 0.5f; }
+    float HalfHeight() const { return swapchainExtent.height * 0.5f; }
 
 private:
     struct CircleData { float cx, cy, radius; Color color; };
