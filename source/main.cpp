@@ -2,16 +2,16 @@
 
 App app;
 
-float cy = 540.0f;
+float cy = 0.0f;
 float vy = 0.0f;
 
 void Init() {
 }
 
 void Update() {
-    vy += 10.0f;
+    vy -= 0.01f;
     cy += vy;
-    app.AddCircle(960, cy, 100, { 1.0f, 0.5f, 0.1f, 1.0f });
+    app.AddCircle(0, cy, 100, { 1.0f, 0.5f, 0.1f, 1.0f });
 }
 
 int main(int, char**) {

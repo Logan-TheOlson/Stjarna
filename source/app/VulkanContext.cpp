@@ -239,11 +239,16 @@ void VulkanContext::RenderFrame() {
         VkRect2D scissor{ {0,0}, swapchainExtent };
         vkCmdSetViewport(cb, 0, 1, &viewport);
         vkCmdSetScissor(cb, 0, 1, &scissor);
+        float invHW = 2.0f / swapchainExtent.width;
+        float invHH = 2.0f / swapchainExtent.height;
         for (auto& c : circles) {
+            // world: (0,0)=center, +x right, +y up  →  NDC: +y down
             CirclePushConstants pc{
                 .r = c.color.r, .g = c.color.g, .b = c.color.b, .a = c.color.a,
-                .cx = c.cx, .cy = c.cy,
-                .screenW = (float)swapchainExtent.width, .screenH = (float)swapchainExtent.height,
+                .ndcCx =  c.cx     * invHW,
+                .ndcCy = -c.cy     * invHH,
+                .ndcRx =  c.radius * invHW,
+                .ndcRy =  c.radius * invHH,
                 .radius = c.radius,
             };
             vkCmdPushConstants(cb, circlePipelineLayout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(pc), &pc);

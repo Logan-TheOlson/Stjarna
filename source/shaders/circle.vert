@@ -2,8 +2,8 @@
 
 layout(push_constant) uniform PC {
     vec4  color;
-    vec2  center;
-    vec2  screenSize;
+    vec2  ndcCenter;
+    vec2  ndcRadius;  // separate x/y for aspect ratio
     float radius;
 } pc;
 
@@ -16,7 +16,5 @@ void main() {
     );
     vec2 q = quad[gl_VertexIndex];
     localPos = q * pc.radius;
-    vec2 pixelPos = pc.center + localPos;
-    vec2 ndc = (pixelPos / pc.screenSize) * 2.0 - 1.0;
-    gl_Position = vec4(ndc, 0.0, 1.0);
+    gl_Position = vec4(pc.ndcCenter + q * pc.ndcRadius, 0.0, 1.0);
 }

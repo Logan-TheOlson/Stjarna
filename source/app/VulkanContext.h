@@ -16,10 +16,10 @@ public:
 private:
     struct CircleData { float cx, cy, radius; Color color; };
     struct CirclePushConstants {
-        float r, g, b, a;
-        float cx, cy;
-        float screenW, screenH;
-        float radius;
+        float r, g, b, a;    // vec4  color
+        float ndcCx, ndcCy;  // vec2  NDC center
+        float ndcRx, ndcRy;  // vec2  NDC half-extents (aspect-correct)
+        float radius;        // float pixel radius for SDF
     };
 
     SDL_Window*      sdlWindow{ nullptr };

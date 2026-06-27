@@ -2,8 +2,8 @@
 
 layout(push_constant) uniform PC {
     vec4  color;
-    vec2  center;
-    vec2  screenSize;
+    vec2  ndcCenter;
+    vec2  ndcRadius;
     float radius;
 } pc;
 
