@@ -1,0 +1,14 @@
+#pragma once
+#include <SDL3/SDL.h>
+
+class Window {
+public:
+    void Init(const char* title, int w, int h);
+    bool PollEvents();
+    void Shutdown();
+
+    SDL_Window* Handle() const { return window; }
+
+private:
+    SDL_Window* window{ nullptr };
+};
