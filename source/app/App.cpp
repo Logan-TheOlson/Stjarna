@@ -3,6 +3,7 @@
 void App::Init(const char* title, int w, int h) {
     window.Init(title, w, h);
     vk.Init(window.Handle());
+    vk.InitImGui(window.Handle());
 }
 
 bool App::PollEvents()  { return window.PollEvents(); }

@@ -3,6 +3,9 @@
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_vulkan.h>
 #include "VulkanContext.h"
+#include <imgui.h>
+#include <imgui_impl_sdl3.h>
+#include <imgui_impl_vulkan.h>
 #include <iostream>
 #include <vector>
 #include <cstdio>
@@ -105,6 +108,36 @@ bool VulkanContext::Init(SDL_Window* window) {
     return true;
 }
 
+void VulkanContext::InitImGui(SDL_Window* window) {
+    IMGUI_CHECKVERSION();
+    ImGui::CreateContext();
+    ImGui::StyleColorsDark();
+    ImGuiStyle& style = ImGui::GetStyle();
+    style.WindowRounding    = 6.0f;
+    style.FrameRounding     = 4.0f;
+    style.WindowBorderSize  = 0.0f;
+
+    ImGui_ImplSDL3_InitForVulkan(window);
+
+    ImGui_ImplVulkan_InitInfo info{};
+    info.ApiVersion      = VK_API_VERSION_1_3;
+    info.Instance        = instance;
+    info.PhysicalDevice  = physicalDevice;
+    info.Device          = device;
+    info.QueueFamily     = queueFamily;
+    info.Queue           = queue;
+    info.DescriptorPoolSize = 16;
+    info.MinImageCount   = 2;
+    info.ImageCount      = (uint32_t)images.size();
+    info.UseDynamicRendering = true;
+    info.PipelineInfoMain.PipelineRenderingCreateInfo = {
+        .sType                   = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO,
+        .colorAttachmentCount    = 1,
+        .pColorAttachmentFormats = &imageFormat,
+    };
+    ImGui_ImplVulkan_Init(&info);
+}
+
 void VulkanContext::CreateSwapchain() {
     VkSurfaceCapabilitiesKHR caps{};
     vkGetPhysicalDeviceSurfaceCapabilitiesKHR(physicalDevice, surface, &caps);
@@ -200,6 +233,29 @@ void VulkanContext::AddCircle(float cx, float cy, float radius, Color color) {
 }
 
 void VulkanContext::RenderFrame() {
+    ImGui_ImplVulkan_NewFrame();
+    ImGui_ImplSDL3_NewFrame();
+    ImGui::NewFrame();
+
+    if (profilerOpen_) {
+        ImGui::SetNextWindowPos(ImVec2(10.f, 10.f), ImGuiCond_Always);
+        ImGui::SetNextWindowBgAlpha(0.75f);
+        ImGui::Begin("Profiler", nullptr,
+            ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize |
+            ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoFocusOnAppearing |
+            ImGuiWindowFlags_NoNav | ImGuiWindowFlags_NoMove);
+        ImGui::TextColored(ImVec4(0.4f, 1.0f, 0.6f, 1.0f), "%.0f fps", profilerStats_.fps);
+        ImGui::Separator();
+        ImGui::Text("frame   %6.2f ms", profilerStats_.frameMs);
+        ImGui::Text("compute %6.2f ms", profilerStats_.computeMs);
+        ImGui::Text("render  %6.2f ms", profilerStats_.renderMs);
+        ImGui::Separator();
+        ImGui::TextDisabled("F1 to close");
+        ImGui::End();
+    }
+
+    ImGui::Render();
+
     chk(vkWaitForFences(device, 1, &fence, VK_TRUE, UINT64_MAX));
 
     uint32_t imageIndex = 0;
@@ -257,6 +313,8 @@ void VulkanContext::RenderFrame() {
         }
     }
 
+    ImGui_ImplVulkan_RenderDrawData(ImGui::GetDrawData(), cb);
+
     vkCmdEndRendering(cb);
     circles.clear();
 
@@ -282,6 +340,9 @@ void VulkanContext::RenderFrame() {
 
 void VulkanContext::Shutdown() {
     vkDeviceWaitIdle(device);
+    ImGui_ImplVulkan_Shutdown();
+    ImGui_ImplSDL3_Shutdown();
+    ImGui::DestroyContext();
     vkDestroyPipeline(device, circlePipeline, nullptr);
     vkDestroyPipelineLayout(device, circlePipelineLayout, nullptr);
     vkDestroyFence(device, fence, nullptr);

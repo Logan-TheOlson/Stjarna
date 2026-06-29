@@ -15,7 +15,12 @@ namespace Config {
     }
 
     namespace Physics {
-        constexpr float HorizontalDamping = 0.85f;
-        constexpr float VerticalDamping   = 0.85f;
+        constexpr float Gravity          = 500.0f;
+        constexpr float Restitution      = 0.85f;
+        constexpr float Damping          = 0.98f;
+        constexpr float Friction         = 0.3f;
+        constexpr float SleepThreshold   = 0.5f;
+        constexpr int   Substeps         = 8;
+        constexpr int   SolverIterations = 3;
     }
 }

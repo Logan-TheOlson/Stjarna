@@ -1,7 +1,8 @@
 #pragma once
 
-struct Circle;
+struct Object;
 
-namespace CollisionEngine {
-    void ResolveBoundary(Circle& circle, float halfW, float halfH);
-}
+struct CollisionEngine {
+    float halfW, halfH;
+    void ResolveBoundary(Object& obj) const;
+};

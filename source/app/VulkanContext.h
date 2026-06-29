@@ -2,15 +2,19 @@
 #include <volk/volk.h>
 #include <vector>
 #include "../Config.h"
+#include "../Profiler.h"
 
 struct SDL_Window;
 
 class VulkanContext {
 public:
     bool Init(SDL_Window* window);
+    void InitImGui(SDL_Window* window);
     void AddCircle(float cx, float cy, float radius, Color color);
     void RenderFrame();
     void Shutdown();
+    void SetProfilerOpen(bool open)                 { profilerOpen_ = open; }
+    void SetProfilerStats(const Profiler::Stats& s) { profilerStats_ = s; }
     int   Width()      const { return (int)swapchainExtent.width; }
     int   Height()     const { return (int)swapchainExtent.height; }
     float HalfWidth()  const { return swapchainExtent.width  * 0.5f; }
@@ -53,6 +57,9 @@ private:
     VkPipeline       circlePipeline{ VK_NULL_HANDLE };
 
     std::vector<CircleData> circles;
+
+    bool           profilerOpen_{ false };
+    Profiler::Stats profilerStats_{};
 
     void CreateSwapchain();
     void RecreateSwapchain();

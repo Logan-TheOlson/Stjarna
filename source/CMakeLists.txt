@@ -2,6 +2,14 @@ cmake_minimum_required(VERSION 3.20 FATAL_ERROR)
 set(NAME Stjarna)
 project(${NAME})
 
+include(FetchContent)
+FetchContent_Declare(imgui
+    GIT_REPOSITORY https://github.com/ocornut/imgui
+    GIT_TAG        master
+    GIT_SHALLOW    TRUE
+)
+FetchContent_MakeAvailable(imgui)
+
 if (NOT IS_DIRECTORY $ENV{VULKAN_SDK})
     message(WARNING "Vulkan SDK not detected, if installed please set VULKAN_SDK env var or manually provide libraries")
 else()
@@ -37,6 +45,29 @@ if (MSVC)
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /EHsc")
 endif()
 
+add_library(imgui_lib STATIC
+    ${imgui_SOURCE_DIR}/imgui.cpp
+    ${imgui_SOURCE_DIR}/imgui_draw.cpp
+    ${imgui_SOURCE_DIR}/imgui_tables.cpp
+    ${imgui_SOURCE_DIR}/imgui_widgets.cpp
+    ${imgui_SOURCE_DIR}/backends/imgui_impl_sdl3.cpp
+    ${imgui_SOURCE_DIR}/backends/imgui_impl_vulkan.cpp
+)
+target_include_directories(imgui_lib PUBLIC
+    ${imgui_SOURCE_DIR}
+    ${imgui_SOURCE_DIR}/backends
+    $ENV{VULKAN_SDK}/include
+)
+target_compile_definitions(imgui_lib PRIVATE
+    IMGUI_IMPL_VULKAN_USE_VOLK
+    "IMGUI_IMPL_VULKAN_VOLK_FILENAME=<volk/volk.h>"
+    VK_NO_PROTOTYPES
+)
+if (CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    target_compile_options(imgui_lib PRIVATE -Wno-stringop-overflow)
+endif()
+target_link_libraries(imgui_lib PRIVATE ${SDL_LIBRARY})
+
 add_executable(${NAME}
     main.cpp
     app/App.cpp
@@ -44,8 +75,11 @@ add_executable(${NAME}
     app/VulkanContext.cpp
     resource.rc
     Stjarna.manifest
-        physics/collision_Engine.cpp
-        physics/collision_Engine.h)
+    Profiler.cpp
+    Object.cpp
+    physics/collision_Engine.cpp
+    physics/collision_Engine.h
+)
 
 target_compile_definitions(${NAME} PRIVATE VK_NO_PROTOTYPES)
 if (WIN32)
@@ -53,5 +87,5 @@ if (WIN32)
 endif()
 set_target_properties(${NAME} PROPERTIES DEBUGGER_WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
 target_compile_features(${NAME} PRIVATE cxx_std_20)
-target_link_libraries(${NAME} PRIVATE ${SDL_LIBRARY})
+target_link_libraries(${NAME} PRIVATE ${SDL_LIBRARY} imgui_lib)
 add_dependencies(${NAME} Shaders)

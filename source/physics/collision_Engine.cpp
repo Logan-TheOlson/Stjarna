@@ -1,22 +1,13 @@
 #include "collision_Engine.h"
-#include "../Circle.h"
+#include "../Object.h"
 #include "../Config.h"
-#include <cmath>
+#include <cassert>
 
-namespace CollisionEngine {
-    void ResolveBoundary(Circle& circle, float halfW, float halfH) {
-        float right  =  halfW - circle.radius;
-        float left   = -halfW + circle.radius;
-        float top    =  halfH - circle.radius;
-        float bottom = -halfH + circle.radius;
-
-        if (circle.x > right)  { circle.x = right;  circle.vx = -circle.vx * Config::Physics::HorizontalDamping; }
-        if (circle.x < left)   { circle.x = left;   circle.vx = -circle.vx * Config::Physics::HorizontalDamping; }
-        if (circle.y > top)    { circle.y = top;     circle.vy = -circle.vy * Config::Physics::VerticalDamping; }
-        if (circle.y < bottom) {
-            circle.y = bottom;
-            circle.vy = -circle.vy * Config::Physics::VerticalDamping;
-        }
-
-    }
+void CollisionEngine::ResolveBoundary(Object& obj) const {
+    assert(halfW > 0.0f && halfH > 0.0f);
+    const float r = obj.shape.radius;
+    if (obj.x >  halfW - r) { obj.x =  halfW - r; obj.vx = -obj.vx * Config::Physics::Restitution; }
+    if (obj.x < -halfW + r) { obj.x = -halfW + r; obj.vx = -obj.vx * Config::Physics::Restitution; }
+    if (obj.y >  halfH - r) { obj.y =  halfH - r; obj.vy = -obj.vy * Config::Physics::Restitution; }
+    if (obj.y < -halfH + r) { obj.y = -halfH + r; obj.vy = -obj.vy * Config::Physics::Restitution; }
 }
