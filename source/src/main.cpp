@@ -17,6 +17,11 @@ Object& createObject(float x, float y, const Circle& shape) {
     return objects.back();
 }
 
+Object& createObject(float x, float y, const Rectangle& shape) {
+    objects.push_back({ x, y, 0.0f, 0.0f, shape });
+    return objects.back();
+}
+
 void Update(float dt) {
     const int n = static_cast<int>(objects.size());
     for (int i = 0; i < n; i++) {
@@ -35,6 +40,7 @@ void Init() {
     createObject(   0.0f,  200.0f, Circle{ 15.0f, { 1.0f, 0.5f, 0.1f, 1.0f } });
     createObject( 120.0f,  300.0f, Circle{ 20.0f, { 0.2f, 0.6f, 1.0f, 1.0f } });
     createObject(-150.0f,  100.0f, Circle{ 12.0f, { 0.4f, 1.0f, 0.3f, 1.0f } });
+    createObject(50.0f, 0.0f, Rectangle{ 40.0f, 25.0f, { 0.9f, 0.3f, 0.3f, 1.0f } });
 }
 
 int main(int, char**) {

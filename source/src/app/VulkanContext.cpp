@@ -2,7 +2,7 @@
 #include <volk/volk.h>
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_vulkan.h>
-#include "VulkanContext.h"
+#include "app/VulkanContext.h"
 #include <imgui.h>
 #include <imgui_impl_sdl3.h>
 #include <imgui_impl_vulkan.h>
@@ -92,7 +92,8 @@ bool VulkanContext::Init(SDL_Window* window) {
             { imageFormat = f.format; colorSpace = f.colorSpace; break; }
 
     CreateSwapchain();
-    CreatePipeline();
+    CreateShapePipeline("circle.vert.spv", "circle.frag.spv", sizeof(CirclePushConstants), circlePipelineLayout, circlePipeline);
+    CreateShapePipeline("rect.vert.spv",   "rect.frag.spv",   sizeof(RectPushConstants),   rectPipelineLayout,   rectPipeline);
 
     VkCommandPoolCreateInfo cpCI{ .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO, .flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT, .queueFamilyIndex = queueFamily };
     chk(vkCreateCommandPool(device, &cpCI, nullptr, &commandPool));
@@ -105,6 +106,7 @@ bool VulkanContext::Init(SDL_Window* window) {
     chk(vkCreateSemaphore(device, &semCI, nullptr, &renderSem));
     chk(vkCreateFence(device, &fenceCI, nullptr, &fence));
     circles.reserve(1024);
+    rects.reserve(1024);
     return true;
 }
 
@@ -184,34 +186,34 @@ void VulkanContext::RecreateSwapchain() {
     CreateSwapchain();
 }
 
-void VulkanContext::CreatePipeline() {
-    auto vertSpv = LoadSpv("circle.vert.spv");
-    auto fragSpv = LoadSpv("circle.frag.spv");
-    VkShaderModule vertMod = MakeShader(device, vertSpv);
-    VkShaderModule fragMod = MakeShader(device, fragSpv);
+void VulkanContext::CreateShapePipeline(const char* vertSpv, const char* fragSpv,
+                                        uint32_t pushSize,
+                                        VkPipelineLayout& outLayout, VkPipeline& outPipeline) {
+    VkShaderModule vertMod = MakeShader(device, LoadSpv(vertSpv));
+    VkShaderModule fragMod = MakeShader(device, LoadSpv(fragSpv));
 
     VkPipelineShaderStageCreateInfo stages[2]{
         { .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_VERTEX_BIT,   .module = vertMod, .pName = "main" },
         { .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_FRAGMENT_BIT, .module = fragMod, .pName = "main" },
     };
-    VkPipelineVertexInputStateCreateInfo vertexInput{ .sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO };
+    VkPipelineVertexInputStateCreateInfo   vertexInput  { .sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO };
     VkPipelineInputAssemblyStateCreateInfo inputAssembly{ .sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO, .topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST };
-    VkPipelineViewportStateCreateInfo viewportState{ .sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO, .viewportCount = 1, .scissorCount = 1 };
-    VkPipelineRasterizationStateCreateInfo rasterizer{ .sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO, .polygonMode = VK_POLYGON_MODE_FILL, .cullMode = VK_CULL_MODE_NONE, .lineWidth = 1.0f };
-    VkPipelineMultisampleStateCreateInfo multisample{ .sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO, .rasterizationSamples = VK_SAMPLE_COUNT_1_BIT };
+    VkPipelineViewportStateCreateInfo      viewportState{ .sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO, .viewportCount = 1, .scissorCount = 1 };
+    VkPipelineRasterizationStateCreateInfo rasterizer   { .sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO, .polygonMode = VK_POLYGON_MODE_FILL, .cullMode = VK_CULL_MODE_NONE, .lineWidth = 1.0f };
+    VkPipelineMultisampleStateCreateInfo   multisample  { .sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO, .rasterizationSamples = VK_SAMPLE_COUNT_1_BIT };
     VkPipelineColorBlendAttachmentState blendAtt{
         .blendEnable = VK_TRUE,
         .srcColorBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA, .dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA, .colorBlendOp = VK_BLEND_OP_ADD,
         .srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE,       .dstAlphaBlendFactor = VK_BLEND_FACTOR_ZERO,               .alphaBlendOp = VK_BLEND_OP_ADD,
         .colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT,
     };
-    VkPipelineColorBlendStateCreateInfo colorBlend{ .sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO, .attachmentCount = 1, .pAttachments = &blendAtt };
+    VkPipelineColorBlendStateCreateInfo colorBlend  { .sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO, .attachmentCount = 1, .pAttachments = &blendAtt };
     VkDynamicState dynStates[]{ VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR };
-    VkPipelineDynamicStateCreateInfo dynamicState{ .sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO, .dynamicStateCount = 2, .pDynamicStates = dynStates };
+    VkPipelineDynamicStateCreateInfo    dynamicState{ .sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO, .dynamicStateCount = 2, .pDynamicStates = dynStates };
 
-    VkPushConstantRange pcRange{ .stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, .size = sizeof(CirclePushConstants) };
+    VkPushConstantRange pcRange{ .stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, .size = pushSize };
     VkPipelineLayoutCreateInfo layoutCI{ .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, .pushConstantRangeCount = 1, .pPushConstantRanges = &pcRange };
-    chk(vkCreatePipelineLayout(device, &layoutCI, nullptr, &circlePipelineLayout));
+    chk(vkCreatePipelineLayout(device, &layoutCI, nullptr, &outLayout));
 
     VkPipelineRenderingCreateInfo renderingCI{ .sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO, .colorAttachmentCount = 1, .pColorAttachmentFormats = &imageFormat };
     VkGraphicsPipelineCreateInfo pipelineCI{
@@ -220,9 +222,9 @@ void VulkanContext::CreatePipeline() {
         .pVertexInputState = &vertexInput, .pInputAssemblyState = &inputAssembly,
         .pViewportState = &viewportState,  .pRasterizationState = &rasterizer,
         .pMultisampleState = &multisample, .pColorBlendState = &colorBlend,
-        .pDynamicState = &dynamicState,    .layout = circlePipelineLayout,
+        .pDynamicState = &dynamicState,    .layout = outLayout,
     };
-    chk(vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1, &pipelineCI, nullptr, &circlePipeline));
+    chk(vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1, &pipelineCI, nullptr, &outPipeline));
 
     vkDestroyShaderModule(device, vertMod, nullptr);
     vkDestroyShaderModule(device, fragMod, nullptr);
@@ -230,6 +232,10 @@ void VulkanContext::CreatePipeline() {
 
 void VulkanContext::AddCircle(float cx, float cy, float radius, Color color) {
     circles.push_back({ cx, cy, radius, color });
+}
+
+void VulkanContext::AddRectangle(float cx, float cy, float halfW, float halfH, Color color) {
+    rects.push_back({ cx, cy, halfW, halfH, color });
 }
 
 void VulkanContext::RenderFrame() {
@@ -262,7 +268,7 @@ void VulkanContext::RenderFrame() {
 
     uint32_t imageIndex = 0;
     VkResult acq = vkAcquireNextImageKHR(device, swapchain, UINT64_MAX, acquireSem, VK_NULL_HANDLE, &imageIndex);
-    if (acq == VK_ERROR_OUT_OF_DATE_KHR) { RecreateSwapchain(); circles.clear(); return; }
+    if (acq == VK_ERROR_OUT_OF_DATE_KHR) { RecreateSwapchain(); circles.clear(); rects.clear(); return; }
     if (acq != VK_SUCCESS && acq != VK_SUBOPTIMAL_KHR) chk(acq);
 
     chk(vkResetFences(device, 1, &fence));
@@ -315,10 +321,34 @@ void VulkanContext::RenderFrame() {
         }
     }
 
+    if (!rects.empty()) {
+        vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, rectPipeline);
+        VkViewport viewport{ 0, 0, (float)swapchainExtent.width, (float)swapchainExtent.height, 0.0f, 1.0f };
+        VkRect2D scissor{ {0,0}, swapchainExtent };
+        vkCmdSetViewport(cb, 0, 1, &viewport);
+        vkCmdSetScissor(cb, 0, 1, &scissor);
+        float invHW = 2.0f / swapchainExtent.width;
+        float invHH = 2.0f / swapchainExtent.height;
+        for (auto& r : rects) {
+            RectPushConstants pc{
+                .r = r.color.r, .g = r.color.g, .b = r.color.b, .a = r.color.a,
+                .ndcCx =  r.cx    * invHW,
+                .ndcCy = -r.cy    * invHH,
+                .ndcHW =  r.halfW * invHW,
+                .ndcHH =  r.halfH * invHH,
+                .pixHW =  r.halfW,
+                .pixHH =  r.halfH,
+            };
+            vkCmdPushConstants(cb, rectPipelineLayout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(pc), &pc);
+            vkCmdDraw(cb, 6, 1, 0, 0);
+        }
+    }
+
     ImGui_ImplVulkan_RenderDrawData(ImGui::GetDrawData(), cb);
 
     vkCmdEndRendering(cb);
     circles.clear();
+    rects.clear();
 
     VkImageMemoryBarrier toPresent{
         .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
@@ -345,6 +375,8 @@ void VulkanContext::Shutdown() {
     ImGui_ImplVulkan_Shutdown();
     ImGui_ImplSDL3_Shutdown();
     ImGui::DestroyContext();
+    vkDestroyPipeline(device, rectPipeline, nullptr);
+    vkDestroyPipelineLayout(device, rectPipelineLayout, nullptr);
     vkDestroyPipeline(device, circlePipeline, nullptr);
     vkDestroyPipelineLayout(device, circlePipelineLayout, nullptr);
     vkDestroyFence(device, fence, nullptr);

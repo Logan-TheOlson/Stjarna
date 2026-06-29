@@ -1,6 +1,6 @@
-#include "Physics.h"
-#include "../Object.h"
-#include "../Config.h"
+#include "physics/Physics.h"
+#include "Object.h"
+#include "Config.h"
 #include <algorithm>
 #include <cmath>
 #include <thread>

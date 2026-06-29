@@ -33,7 +33,18 @@ add_custom_command(
     DEPENDS ${SHADER_DIR}/circle.vert ${SHADER_DIR}/circle.frag
     VERBATIM
 )
-add_custom_target(Shaders DEPENDS ${SHADER_OUT}/circle.vert.spv ${SHADER_OUT}/circle.frag.spv)
+add_custom_command(
+    OUTPUT  ${SHADER_OUT}/rect.vert.spv ${SHADER_OUT}/rect.frag.spv
+    COMMAND ${CMAKE_COMMAND} -E make_directory ${SHADER_OUT}
+    COMMAND ${GLSLC} ${SHADER_DIR}/rect.vert -o ${SHADER_OUT}/rect.vert.spv
+    COMMAND ${GLSLC} ${SHADER_DIR}/rect.frag -o ${SHADER_OUT}/rect.frag.spv
+    DEPENDS ${SHADER_DIR}/rect.vert ${SHADER_DIR}/rect.frag
+    VERBATIM
+)
+add_custom_target(Shaders DEPENDS
+    ${SHADER_OUT}/circle.vert.spv ${SHADER_OUT}/circle.frag.spv
+    ${SHADER_OUT}/rect.vert.spv   ${SHADER_OUT}/rect.frag.spv
+)
 
 if (WIN32)
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -DVK_USE_PLATFORM_WIN32_KHR")
@@ -69,18 +80,18 @@ endif()
 target_link_libraries(imgui_lib PRIVATE ${SDL_LIBRARY})
 
 add_executable(${NAME}
-    main.cpp
-    app/App.cpp
-    app/Window.cpp
-    app/VulkanContext.cpp
+    src/main.cpp
+    src/app/App.cpp
+    src/app/Window.cpp
+    src/app/VulkanContext.cpp
+    src/Profiler.cpp
+    src/Object.cpp
+    src/physics/collision_Engine.cpp
     resource.rc
     Stjarna.manifest
-    Profiler.cpp
-    Object.cpp
-    physics/collision_Engine.cpp
-    physics/collision_Engine.h
 )
 
+target_include_directories(${NAME} PRIVATE include)
 target_compile_definitions(${NAME} PRIVATE VK_NO_PROTOTYPES)
 if (WIN32)
     target_compile_definitions(${NAME} PRIVATE _CRT_SECURE_NO_WARNINGS)

@@ -10,6 +10,7 @@ public:
     void RenderFrame();
     void Shutdown();
     void AddCircle(float cx, float cy, float radius, Color color);
+    void AddRectangle(float cx, float cy, float halfW, float halfH, Color color);
     bool TakeF1Toggle()                             { return window.TakeF1Toggle(); }
     void SetProfilerOpen(bool open)                 { vk.SetProfilerOpen(open); }
     void SetProfilerStats(const Profiler::Stats& s) { vk.SetProfilerStats(s); }

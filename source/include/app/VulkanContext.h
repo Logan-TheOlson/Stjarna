@@ -11,6 +11,7 @@ public:
     bool Init(SDL_Window* window);
     void InitImGui(SDL_Window* window);
     void AddCircle(float cx, float cy, float radius, Color color);
+    void AddRectangle(float cx, float cy, float halfW, float halfH, Color color);
     void RenderFrame();
     void Shutdown();
     void SetProfilerOpen(bool open)                 { profilerOpen_ = open; }
@@ -24,10 +25,18 @@ public:
 private:
     struct CircleData { float cx, cy, radius; Color color; };
     struct CirclePushConstants {
-        float r, g, b, a;    // vec4  color
-        float ndcCx, ndcCy;  // vec2  NDC center
-        float ndcRx, ndcRy;  // vec2  NDC half-extents (aspect-correct)
-        float radius;        // float pixel radius for SDF
+        float r, g, b, a;
+        float ndcCx, ndcCy;
+        float ndcRx, ndcRy;
+        float radius;
+    };
+
+    struct RectData { float cx, cy, halfW, halfH; Color color; };
+    struct RectPushConstants {
+        float r, g, b, a;
+        float ndcCx, ndcCy;
+        float ndcHW, ndcHH;
+        float pixHW, pixHH;
     };
 
     SDL_Window*      sdlWindow{ nullptr };
@@ -56,8 +65,11 @@ private:
 
     VkPipelineLayout circlePipelineLayout{ VK_NULL_HANDLE };
     VkPipeline       circlePipeline{ VK_NULL_HANDLE };
+    VkPipelineLayout rectPipelineLayout{ VK_NULL_HANDLE };
+    VkPipeline       rectPipeline{ VK_NULL_HANDLE };
 
     std::vector<CircleData> circles;
+    std::vector<RectData>   rects;
 
     bool            profilerOpen_{ false };
     Profiler::Stats profilerStats_{};
@@ -65,5 +77,7 @@ private:
 
     void CreateSwapchain();
     void RecreateSwapchain();
-    void CreatePipeline();
+    void CreateShapePipeline(const char* vertSpv, const char* fragSpv,
+                             uint32_t pushSize,
+                             VkPipelineLayout& outLayout, VkPipeline& outPipeline);
 };

@@ -1,8 +1,8 @@
-#include "ImpulseSolver.h"
-#include "../Object.h"
-#include "../Config.h"
-#include "collision_Engine.h"
-#include "SpatialGrid.h"
+#include "physics/ImpulseSolver.h"
+#include "Object.h"
+#include "Config.h"
+#include "physics/collision_Engine.h"
+#include "physics/SpatialGrid.h"
 #include <cmath>
 
 void ImpulseSolver::Solve(std::span<Object> objects, SpatialGrid& grid, float hw, float hh, float dt) {
