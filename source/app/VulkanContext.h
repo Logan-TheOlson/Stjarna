@@ -15,6 +15,7 @@ public:
     void Shutdown();
     void SetProfilerOpen(bool open)                 { profilerOpen_ = open; }
     void SetProfilerStats(const Profiler::Stats& s) { profilerStats_ = s; }
+    void SetObjectCount(int n)                      { objectCount_ = n; }
     int   Width()      const { return (int)swapchainExtent.width; }
     int   Height()     const { return (int)swapchainExtent.height; }
     float HalfWidth()  const { return swapchainExtent.width  * 0.5f; }
@@ -58,8 +59,9 @@ private:
 
     std::vector<CircleData> circles;
 
-    bool           profilerOpen_{ false };
+    bool            profilerOpen_{ false };
     Profiler::Stats profilerStats_{};
+    int             objectCount_{ 0 };
 
     void CreateSwapchain();
     void RecreateSwapchain();

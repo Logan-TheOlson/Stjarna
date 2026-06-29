@@ -63,6 +63,7 @@ int main(int, char**) {
         app.RenderFrame();
 
         profiler.MarkRenderEnd();
+        app.SetObjectCount(static_cast<int>(objects.size()));
         if (profiler.Tick())
             app.SetProfilerStats(profiler.GetStats());
 

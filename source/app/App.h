@@ -13,6 +13,7 @@ public:
     bool TakeF1Toggle()                             { return window.TakeF1Toggle(); }
     void SetProfilerOpen(bool open)                 { vk.SetProfilerOpen(open); }
     void SetProfilerStats(const Profiler::Stats& s) { vk.SetProfilerStats(s); }
+    void SetObjectCount(int n)                      { vk.SetObjectCount(n); }
     int   Width()      const;
     int   Height()     const;
     float HalfWidth()  const;

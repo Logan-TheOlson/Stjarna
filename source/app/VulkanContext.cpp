@@ -250,6 +250,8 @@ void VulkanContext::RenderFrame() {
         ImGui::Text("compute %6.2f ms", profilerStats_.computeMs);
         ImGui::Text("render  %6.2f ms", profilerStats_.renderMs);
         ImGui::Separator();
+        ImGui::Text("objects %d", objectCount_);
+        ImGui::Separator();
         ImGui::TextDisabled("F1 to close");
         ImGui::End();
     }
