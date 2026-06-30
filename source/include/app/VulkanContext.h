@@ -23,21 +23,22 @@ public:
     float HalfHeight() const { return swapchainExtent.height * 0.5f; }
 
 private:
-    struct CircleData { float cx, cy, radius; Color color; };
-    struct CirclePushConstants {
-        float r, g, b, a;
-        float ndcCx, ndcCy;
-        float ndcRx, ndcRy;
-        float radius;
+    // SSBO instance data — world-space coords; NDC computed in vertex shader via push constants
+    struct CircleData {
+        float r, g, b, a;  // vec4 color  — offset  0
+        float cx, cy;      // vec2 center — offset 16
+        float radius;      //               offset 24
+        float _pad;        //               offset 28, total 32
     };
+    struct RectData {
+        float r, g, b, a;   // vec4 color  — offset  0
+        float cx, cy;       // vec2 center — offset 16
+        float halfW, halfH; // vec2 size   — offset 24, total 32
+    };
+    static_assert(sizeof(CircleData) == 32);
+    static_assert(sizeof(RectData)   == 32);
 
-    struct RectData { float cx, cy, halfW, halfH; Color color; };
-    struct RectPushConstants {
-        float r, g, b, a;
-        float ndcCx, ndcCy;
-        float ndcHW, ndcHH;
-        float pixHW, pixHH;
-    };
+    static constexpr uint32_t kMaxObjects = 100000;
 
     SDL_Window*      sdlWindow{ nullptr };
 
@@ -63,6 +64,18 @@ private:
     VkSemaphore renderSem{ VK_NULL_HANDLE };
     VkFence     fence{ VK_NULL_HANDLE };
 
+    VkDescriptorSetLayout shapeDescSetLayout{ VK_NULL_HANDLE };
+    VkDescriptorPool      descPool{ VK_NULL_HANDLE };
+    VkDescriptorSet       circleDescSet{ VK_NULL_HANDLE };
+    VkDescriptorSet       rectDescSet{ VK_NULL_HANDLE };
+
+    VkBuffer       circleSSBO{ VK_NULL_HANDLE };
+    VkDeviceMemory circleSSBOMemory{ VK_NULL_HANDLE };
+    void*          circleMapped{ nullptr };
+    VkBuffer       rectSSBO{ VK_NULL_HANDLE };
+    VkDeviceMemory rectSSBOMemory{ VK_NULL_HANDLE };
+    void*          rectMapped{ nullptr };
+
     VkPipelineLayout circlePipelineLayout{ VK_NULL_HANDLE };
     VkPipeline       circlePipeline{ VK_NULL_HANDLE };
     VkPipelineLayout rectPipelineLayout{ VK_NULL_HANDLE };
@@ -78,6 +91,7 @@ private:
     void CreateSwapchain();
     void RecreateSwapchain();
     void CreateShapePipeline(const char* vertSpv, const char* fragSpv,
-                             uint32_t pushSize,
+                             VkDescriptorSetLayout descSetLayout,
                              VkPipelineLayout& outLayout, VkPipeline& outPipeline);
+    void CreateSSBO(VkDeviceSize size, VkBuffer& buf, VkDeviceMemory& mem, void*& mapped);
 };

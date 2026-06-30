@@ -9,6 +9,7 @@
 #include <iostream>
 #include <vector>
 #include <cstdio>
+#include <cstring>
 
 static void chk(VkResult r) {
     if (r != VK_SUCCESS) { std::cerr << "Vulkan error: " << r << "\n"; exit(1); }
@@ -92,8 +93,54 @@ bool VulkanContext::Init(SDL_Window* window) {
             { imageFormat = f.format; colorSpace = f.colorSpace; break; }
 
     CreateSwapchain();
-    CreateShapePipeline("circle.vert.spv", "circle.frag.spv", sizeof(CirclePushConstants), circlePipelineLayout, circlePipeline);
-    CreateShapePipeline("rect.vert.spv",   "rect.frag.spv",   sizeof(RectPushConstants),   rectPipelineLayout,   rectPipeline);
+
+    // Shared descriptor set layout: one SSBO at binding 0, vertex stage
+    VkDescriptorSetLayoutBinding ssboBinding{
+        .binding = 0,
+        .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+        .descriptorCount = 1,
+        .stageFlags = VK_SHADER_STAGE_VERTEX_BIT,
+    };
+    VkDescriptorSetLayoutCreateInfo dslCI{
+        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+        .bindingCount = 1, .pBindings = &ssboBinding,
+    };
+    chk(vkCreateDescriptorSetLayout(device, &dslCI, nullptr, &shapeDescSetLayout));
+
+    CreateShapePipeline("circle.vert.spv", "circle.frag.spv", shapeDescSetLayout, circlePipelineLayout, circlePipeline);
+    CreateShapePipeline("rect.vert.spv",   "rect.frag.spv",   shapeDescSetLayout, rectPipelineLayout,   rectPipeline);
+
+    // SSBOs — persistently mapped, host-visible + coherent
+    const VkDeviceSize circleSSBOSize = kMaxObjects * sizeof(CircleData);
+    const VkDeviceSize rectSSBOSize   = kMaxObjects * sizeof(RectData);
+    CreateSSBO(circleSSBOSize, circleSSBO, circleSSBOMemory, circleMapped);
+    CreateSSBO(rectSSBOSize,   rectSSBO,   rectSSBOMemory,   rectMapped);
+
+    // Descriptor pool + sets
+    VkDescriptorPoolSize poolSize{ .type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 2 };
+    VkDescriptorPoolCreateInfo poolCI{
+        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
+        .maxSets = 2, .poolSizeCount = 1, .pPoolSizes = &poolSize,
+    };
+    chk(vkCreateDescriptorPool(device, &poolCI, nullptr, &descPool));
+
+    VkDescriptorSetLayout layouts[2] = { shapeDescSetLayout, shapeDescSetLayout };
+    VkDescriptorSetAllocateInfo dsAllocInfo{
+        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+        .descriptorPool = descPool, .descriptorSetCount = 2, .pSetLayouts = layouts,
+    };
+    VkDescriptorSet sets[2];
+    chk(vkAllocateDescriptorSets(device, &dsAllocInfo, sets));
+    circleDescSet = sets[0];
+    rectDescSet   = sets[1];
+
+    VkDescriptorBufferInfo circleBI{ .buffer = circleSSBO, .offset = 0, .range = VK_WHOLE_SIZE };
+    VkDescriptorBufferInfo rectBI  { .buffer = rectSSBO,   .offset = 0, .range = VK_WHOLE_SIZE };
+    VkWriteDescriptorSet writes[2]{
+        { .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = circleDescSet, .dstBinding = 0, .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .pBufferInfo = &circleBI },
+        { .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = rectDescSet,   .dstBinding = 0, .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .pBufferInfo = &rectBI   },
+    };
+    vkUpdateDescriptorSets(device, 2, writes, 0, nullptr);
 
     VkCommandPoolCreateInfo cpCI{ .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO, .flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT, .queueFamilyIndex = queueFamily };
     chk(vkCreateCommandPool(device, &cpCI, nullptr, &commandPool));
@@ -105,8 +152,9 @@ bool VulkanContext::Init(SDL_Window* window) {
     chk(vkCreateSemaphore(device, &semCI, nullptr, &acquireSem));
     chk(vkCreateSemaphore(device, &semCI, nullptr, &renderSem));
     chk(vkCreateFence(device, &fenceCI, nullptr, &fence));
-    circles.reserve(1024);
-    rects.reserve(1024);
+
+    circles.reserve(kMaxObjects);
+    rects.reserve(kMaxObjects);
     return true;
 }
 
@@ -187,7 +235,7 @@ void VulkanContext::RecreateSwapchain() {
 }
 
 void VulkanContext::CreateShapePipeline(const char* vertSpv, const char* fragSpv,
-                                        uint32_t pushSize,
+                                        VkDescriptorSetLayout descSetLayout,
                                         VkPipelineLayout& outLayout, VkPipeline& outPipeline) {
     VkShaderModule vertMod = MakeShader(device, LoadSpv(vertSpv));
     VkShaderModule fragMod = MakeShader(device, LoadSpv(fragSpv));
@@ -211,8 +259,12 @@ void VulkanContext::CreateShapePipeline(const char* vertSpv, const char* fragSpv
     VkDynamicState dynStates[]{ VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR };
     VkPipelineDynamicStateCreateInfo    dynamicState{ .sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO, .dynamicStateCount = 2, .pDynamicStates = dynStates };
 
-    VkPushConstantRange pcRange{ .stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, .size = pushSize };
-    VkPipelineLayoutCreateInfo layoutCI{ .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, .pushConstantRangeCount = 1, .pPushConstantRanges = &pcRange };
+    VkPushConstantRange pcRange{ .stageFlags = VK_SHADER_STAGE_VERTEX_BIT, .offset = 0, .size = 2 * sizeof(float) };
+    VkPipelineLayoutCreateInfo layoutCI{
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+        .setLayoutCount = 1, .pSetLayouts = &descSetLayout,
+        .pushConstantRangeCount = 1, .pPushConstantRanges = &pcRange,
+    };
     chk(vkCreatePipelineLayout(device, &layoutCI, nullptr, &outLayout));
 
     VkPipelineRenderingCreateInfo renderingCI{ .sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO, .colorAttachmentCount = 1, .pColorAttachmentFormats = &imageFormat };
@@ -230,12 +282,48 @@ void VulkanContext::CreateShapePipeline(const char* vertSpv, const char* fragSpv
     vkDestroyShaderModule(device, fragMod, nullptr);
 }
 
+void VulkanContext::CreateSSBO(VkDeviceSize size, VkBuffer& buf, VkDeviceMemory& mem, void*& mapped) {
+    VkBufferCreateInfo bCI{
+        .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+        .size = size,
+        .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+        .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+    };
+    chk(vkCreateBuffer(device, &bCI, nullptr, &buf));
+
+    VkMemoryRequirements memReq{};
+    vkGetBufferMemoryRequirements(device, buf, &memReq);
+
+    VkPhysicalDeviceMemoryProperties memProps{};
+    vkGetPhysicalDeviceMemoryProperties(physicalDevice, &memProps);
+
+    uint32_t memTypeIndex = UINT32_MAX;
+    const VkMemoryPropertyFlags required = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+    for (uint32_t i = 0; i < memProps.memoryTypeCount; i++) {
+        if ((memReq.memoryTypeBits & (1u << i)) && (memProps.memoryTypes[i].propertyFlags & required) == required) {
+            memTypeIndex = i; break;
+        }
+    }
+    if (memTypeIndex == UINT32_MAX) { std::cerr << "No suitable memory type for SSBO\n"; exit(1); }
+
+    VkMemoryAllocateInfo allocInfo{
+        .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+        .allocationSize = memReq.size,
+        .memoryTypeIndex = memTypeIndex,
+    };
+    chk(vkAllocateMemory(device, &allocInfo, nullptr, &mem));
+    chk(vkBindBufferMemory(device, buf, mem, 0));
+    chk(vkMapMemory(device, mem, 0, VK_WHOLE_SIZE, 0, &mapped));
+}
+
 void VulkanContext::AddCircle(float cx, float cy, float radius, Color color) {
-    circles.push_back({ cx, cy, radius, color });
+    if (circles.size() >= kMaxObjects) return;
+    circles.push_back({ color.r, color.g, color.b, color.a, cx, cy, radius, 0.0f });
 }
 
 void VulkanContext::AddRectangle(float cx, float cy, float halfW, float halfH, Color color) {
-    rects.push_back({ cx, cy, halfW, halfH, color });
+    if (rects.size() >= kMaxObjects) return;
+    rects.push_back({ color.r, color.g, color.b, color.a, cx, cy, halfW, halfH });
 }
 
 void VulkanContext::RenderFrame() {
@@ -268,8 +356,8 @@ void VulkanContext::RenderFrame() {
 
     uint32_t imageIndex = 0;
     VkResult acq = vkAcquireNextImageKHR(device, swapchain, UINT64_MAX, acquireSem, VK_NULL_HANDLE, &imageIndex);
-    if (acq == VK_ERROR_OUT_OF_DATE_KHR) { RecreateSwapchain(); circles.clear(); rects.clear(); return; }
-    if (acq != VK_SUCCESS && acq != VK_SUBOPTIMAL_KHR) chk(acq);
+    if (acq == VK_ERROR_OUT_OF_DATE_KHR || acq == VK_SUBOPTIMAL_KHR) { RecreateSwapchain(); circles.clear(); rects.clear(); return; }
+    if (acq != VK_SUCCESS) chk(acq);
 
     chk(vkResetFences(device, 1, &fence));
     chk(vkResetCommandBuffer(cb, 0));
@@ -298,49 +386,30 @@ void VulkanContext::RenderFrame() {
     };
     vkCmdBeginRendering(cb, &renderingInfo);
 
-    if (!circles.empty()) {
-        vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, circlePipeline);
+    {
         VkViewport viewport{ 0, 0, (float)swapchainExtent.width, (float)swapchainExtent.height, 0.0f, 1.0f };
-        VkRect2D scissor{ {0,0}, swapchainExtent };
+        VkRect2D   scissor{ {0,0}, swapchainExtent };
         vkCmdSetViewport(cb, 0, 1, &viewport);
         vkCmdSetScissor(cb, 0, 1, &scissor);
-        float invHW = 2.0f / swapchainExtent.width;
-        float invHH = 2.0f / swapchainExtent.height;
-        for (auto& c : circles) {
-            // world: (0,0)=center, +x right, +y up  →  NDC: +y down
-            CirclePushConstants pc{
-                .r = c.color.r, .g = c.color.g, .b = c.color.b, .a = c.color.a,
-                .ndcCx =  c.cx     * invHW,
-                .ndcCy = -c.cy     * invHH,
-                .ndcRx =  c.radius * invHW,
-                .ndcRy =  c.radius * invHH,
-                .radius = c.radius,
-            };
-            vkCmdPushConstants(cb, circlePipelineLayout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(pc), &pc);
-            vkCmdDraw(cb, 6, 1, 0, 0);
-        }
-    }
 
-    if (!rects.empty()) {
-        vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, rectPipeline);
-        VkViewport viewport{ 0, 0, (float)swapchainExtent.width, (float)swapchainExtent.height, 0.0f, 1.0f };
-        VkRect2D scissor{ {0,0}, swapchainExtent };
-        vkCmdSetViewport(cb, 0, 1, &viewport);
-        vkCmdSetScissor(cb, 0, 1, &scissor);
-        float invHW = 2.0f / swapchainExtent.width;
-        float invHH = 2.0f / swapchainExtent.height;
-        for (auto& r : rects) {
-            RectPushConstants pc{
-                .r = r.color.r, .g = r.color.g, .b = r.color.b, .a = r.color.a,
-                .ndcCx =  r.cx    * invHW,
-                .ndcCy = -r.cy    * invHH,
-                .ndcHW =  r.halfW * invHW,
-                .ndcHH =  r.halfH * invHH,
-                .pixHW =  r.halfW,
-                .pixHH =  r.halfH,
-            };
-            vkCmdPushConstants(cb, rectPipelineLayout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(pc), &pc);
-            vkCmdDraw(cb, 6, 1, 0, 0);
+        float invScreen[2] = { 2.0f / swapchainExtent.width, 2.0f / swapchainExtent.height };
+
+        if (!circles.empty()) {
+            const uint32_t n = (uint32_t)circles.size();
+            memcpy(circleMapped, circles.data(), n * sizeof(CircleData));
+            vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, circlePipeline);
+            vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, circlePipelineLayout, 0, 1, &circleDescSet, 0, nullptr);
+            vkCmdPushConstants(cb, circlePipelineLayout, VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(invScreen), invScreen);
+            vkCmdDraw(cb, 6, n, 0, 0);
+        }
+
+        if (!rects.empty()) {
+            const uint32_t n = (uint32_t)rects.size();
+            memcpy(rectMapped, rects.data(), n * sizeof(RectData));
+            vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, rectPipeline);
+            vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, rectPipelineLayout, 0, 1, &rectDescSet, 0, nullptr);
+            vkCmdPushConstants(cb, rectPipelineLayout, VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(invScreen), invScreen);
+            vkCmdDraw(cb, 6, n, 0, 0);
         }
     }
 
@@ -379,6 +448,14 @@ void VulkanContext::Shutdown() {
     vkDestroyPipelineLayout(device, rectPipelineLayout, nullptr);
     vkDestroyPipeline(device, circlePipeline, nullptr);
     vkDestroyPipelineLayout(device, circlePipelineLayout, nullptr);
+    vkUnmapMemory(device, rectSSBOMemory);
+    vkDestroyBuffer(device, rectSSBO, nullptr);
+    vkFreeMemory(device, rectSSBOMemory, nullptr);
+    vkUnmapMemory(device, circleSSBOMemory);
+    vkDestroyBuffer(device, circleSSBO, nullptr);
+    vkFreeMemory(device, circleSSBOMemory, nullptr);
+    vkDestroyDescriptorPool(device, descPool, nullptr);
+    vkDestroyDescriptorSetLayout(device, shapeDescSetLayout, nullptr);
     vkDestroyFence(device, fence, nullptr);
     vkDestroySemaphore(device, renderSem, nullptr);
     vkDestroySemaphore(device, acquireSem, nullptr);
