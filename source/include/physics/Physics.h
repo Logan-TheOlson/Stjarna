@@ -14,7 +14,6 @@ public:
 private:
     void ResolveCollisions(std::span<Object> objects, SpatialGrid& grid);
 
-    static void Integrate(std::span<Object> objects, float subDt);
     static void ResolveBoundaries(std::span<Object> objects, float hw, float hh);
     static void ResolveCell(std::span<Object> objects, SpatialGrid& grid, int col, int row);
 

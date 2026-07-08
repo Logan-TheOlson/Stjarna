@@ -87,6 +87,7 @@ add_executable(${NAME}
     src/Profiler.cpp
     src/Object.cpp
     src/physics/collision_Engine.cpp
+    src/physics/Physics.cpp
     resource.rc
     Stjarna.manifest
 )
