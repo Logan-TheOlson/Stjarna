@@ -30,17 +30,16 @@ Object& createObject(float x, float y, const Rectangle& shape) {
     return objects.back();
 }
 
-// Called once before the first frame — equivalent to Unity's Start()
 void Init() {
     objects.reserve(100000);
     grid = SpatialGrid{ app.HalfWidth(), app.HalfHeight(), 2.0f * Config::Defaults::CircleRadius };
 
-    constexpr float radius  = 5.0f;
-    constexpr float spacing = radius * 2.0f;
-    constexpr float startX  = -(99 * spacing / 2.0f);
-    constexpr float startY  = -(99 * spacing / 2.0f);
-    for (int x = 0; x < 100; x++) {
-        for (int y = 0; y < 100; y++) {
+    constexpr float radius  = 10.0f;
+    constexpr float spacing = radius * 10.0f;
+    constexpr float startX  = -(4 * spacing / 2.0f);
+    constexpr float startY  = -(4 * spacing / 2.0f);
+    for (int x = 0; x < 5; x++) {
+        for (int y = 0; y < 5; y++) {
             createObject(startX + static_cast<float>(x) * spacing, startY + static_cast<float>(y) * spacing, Circle{ radius, { 0.2f, 0.6f, 1.0f, 1.0f } });
         }
     }
@@ -48,9 +47,7 @@ void Init() {
 
 void Update(float dt, Physics& physics) {
     for (auto& obj : objects) {
-        obj.vy -= Config::Physics::Gravity * dt;
-        obj.vx *= Config::Physics::Damping;
-        obj.vy *= Config::Physics::Damping;
+        obj.vy -= Config::Physics::Gravity * dt * 5;
         obj.x  += obj.vx * dt;
         obj.y  += obj.vy * dt;
     }
