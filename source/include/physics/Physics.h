@@ -1,23 +1,19 @@
 #pragma once
-#include "SpatialGrid.h"
-#include "ThreadPool.h"
 #include <span>
-#include <utility>
-#include <vector>
 
 struct Object;
+class SpatialGrid;
 
 class Physics {
 public:
-    void Solve(std::span<Object> objects, SpatialGrid& grid, float hw, float hh, float dt);
+    // Forces — accumulate into object.ax / object.ay
+    static void ApplyGravity(std::span<Object> objects);
+    static void ApplyForce(Object& obj, float fx, float fy);
+
+    // Constraints — call after forces, before or after grid rebuild
+    static void ResolveBoundaries(std::span<Object> objects, float hw, float hh);
+    static void ResolveCollisions(std::span<Object> objects, const SpatialGrid& grid);
 
 private:
-    void ResolveCollisions(std::span<Object> objects, SpatialGrid& grid);
-
-    static void ResolveBoundaries(std::span<Object> objects, float hw, float hh);
-    static void ResolveCell(std::span<Object> objects, SpatialGrid& grid, int col, int row);
-
-    const int  threadCount_{ (int)std::max(1u, std::thread::hardware_concurrency()) };
-    ThreadPool pool_{ threadCount_ };
-    std::vector<std::pair<int,int>> colorCells_;
+    static void ResolveCell(std::span<Object> objects, const SpatialGrid& grid, int col, int row);
 };

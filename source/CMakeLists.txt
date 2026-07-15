@@ -80,13 +80,13 @@ endif()
 target_link_libraries(imgui_lib PRIVATE ${SDL_LIBRARY})
 
 add_executable(${NAME}
-    src/main.cpp
+    src/main.cpp       # user scene: Init() + Update()
+    src/Engine.cpp     # engine loop + object management
     src/app/App.cpp
     src/app/Window.cpp
     src/app/VulkanContext.cpp
     src/Profiler.cpp
     src/Object.cpp
-    src/physics/collision_Engine.cpp
     src/physics/Physics.cpp
     resource.rc
     Stjarna.manifest

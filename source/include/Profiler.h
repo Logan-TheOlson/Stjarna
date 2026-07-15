@@ -1,6 +1,5 @@
 #pragma once
 #include <chrono>
-#include <string>
 
 class Profiler {
     using Clock = std::chrono::steady_clock;
@@ -17,13 +16,11 @@ public:
     void MarkFrameStart();
     void MarkComputeEnd();
     void MarkRenderEnd();
-    void SetTag(const char* tag) { tag_ = tag; }
-    bool        Tick();    // returns true once per kSamples frames when stats refresh
+    bool         Tick();
     const Stats& GetStats() const { return stats_; }
 private:
     TP    frameStart_{}, computeEnd_{};
     float accFrame_{ 0 }, accCompute_{ 0 }, accRender_{ 0 };
     int   count_{ 0 };
-    std::string tag_;
     Stats stats_;
 };

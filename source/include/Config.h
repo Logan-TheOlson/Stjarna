@@ -9,16 +9,14 @@ namespace Config {
     constexpr int         WindowHeight = 1080;
 
     namespace Defaults {
-        constexpr Vec2  CirclePos    = { 0.0f, 0.0f };
         constexpr float CircleRadius = 10.0f;
         constexpr Color CircleColor  = { 1.0f, 0.5f, 0.1f, 1.0f };
     }
 
     namespace Physics {
-        constexpr float Gravity          = 500.0f;
-        constexpr float Restitution      = 0.85f;
-        constexpr float Friction         = 0.3f;
-        constexpr int   Substeps         = 8;
-        constexpr int   SolverIterations = 3;
+        constexpr float Gravity     = 2500.0f;  // pixels/s^2
+        constexpr float Restitution = 0.85f;
+        constexpr float Friction    = 0.3f;
+        constexpr int   Substeps    = 8;
     }
 }

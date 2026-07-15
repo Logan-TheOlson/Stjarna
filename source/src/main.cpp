@@ -1,92 +1,27 @@
-#include "app/App.h"
-#include "Object.h"
+#include "Engine.h"
 #include "physics/Physics.h"
-#include "physics/SpatialGrid.h"
-#include "Profiler.h"
 #include "Config.h"
-#include <chrono>
-#include <cmath>
-#include <vector>
-
-App                 app;
-std::vector<Object> objects;
-SpatialGrid         grid;
-Profiler            profiler;
-bool                profilerOpen = false;
-
-// O(1) removal — swaps with last element, invalidating index i
-void removeObject(size_t i) {
-    objects[i] = objects.back();
-    objects.pop_back();
-}
-
-Object& createObject(float x, float y, const Circle& shape) {
-    objects.push_back({ x, y, 0.0f, 0.0f, shape });
-    return objects.back();
-}
-
-Object& createObject(float x, float y, const Rectangle& shape) {
-    objects.push_back({ x, y, 0.0f, 0.0f, shape });
-    return objects.back();
-}
 
 void Init() {
-    objects.reserve(100000);
-    grid = SpatialGrid{ app.HalfWidth(), app.HalfHeight(), 2.0f * Config::Defaults::CircleRadius };
-
-    constexpr float radius  = 10.0f;
+    constexpr float radius  = Config::Defaults::CircleRadius;
     constexpr float spacing = radius * 10.0f;
     constexpr float startX  = -(4 * spacing / 2.0f);
     constexpr float startY  = -(4 * spacing / 2.0f);
-    for (int x = 0; x < 5; x++) {
-        for (int y = 0; y < 5; y++) {
-            createObject(startX + static_cast<float>(x) * spacing, startY + static_cast<float>(y) * spacing, Circle{ radius, { 0.2f, 0.6f, 1.0f, 1.0f } });
-        }
-    }
+    for (int x = 0; x < 5; x++)
+        for (int y = 0; y < 5; y++)
+            CreateObject(startX + static_cast<float>(x) * spacing,
+                         startY + static_cast<float>(y) * spacing,
+                         Circle{ radius, { 0.2f, 0.6f, 1.0f, 1.0f } });
 }
 
-void Update(float dt, Physics& physics) {
-    for (auto& obj : objects) {
-        obj.vy -= Config::Physics::Gravity * dt * 5;
-        obj.x  += obj.vx * dt;
-        obj.y  += obj.vy * dt;
-    }
-    physics.Solve(objects, grid, app.HalfWidth(), app.HalfHeight(), dt);
-}
+void Update(float) {
 
-int main(int, char**) {
-    app.Init(Config::WindowTitle, Config::WindowWidth, Config::WindowHeight);
-    Physics physics;   // ThreadPool starts here, safely after main() begins
-    Init();
+    Physics::ApplyGravity(objects);
 
-    using Clock = std::chrono::steady_clock;
-    auto last = Clock::now();
+    Physics::ResolveBoundaries(objects, ScreenHalfWidth(), ScreenHalfHeight());
 
-    profiler.MarkFrameStart();
-    while (app.PollEvents()) {
-        if (app.TakeF1Toggle()) {
-            profilerOpen = !profilerOpen;
-            app.SetProfilerOpen(profilerOpen);
-        }
-
-        auto  now = Clock::now();
-        float dt  = std::min(std::chrono::duration<float>(now - last).count(), 1.0f / 30.0f);
-        last      = now;
-
-        Update(dt, physics);
-        profiler.MarkComputeEnd();
-
-        for (auto& obj : objects)
-            obj.Draw(app);
-
-        app.RenderFrame();
-        profiler.MarkRenderEnd();
-        app.SetObjectCount(static_cast<int>(objects.size()));
-        if (profiler.Tick())
-            app.SetProfilerStats(profiler.GetStats());
-
-        profiler.MarkFrameStart();
-    }
-    app.Shutdown();
-    return 0;
+    grid.Clear();
+    for (int i = 0; i < static_cast<int>(objects.size()); i++)
+        grid.Insert(i, objects[i].x, objects[i].y);
+    Physics::ResolveCollisions(objects, grid);
 }

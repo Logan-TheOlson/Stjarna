@@ -1,20 +1,18 @@
 #include "physics/Physics.h"
+#include "physics/SpatialGrid.h"
 #include "Object.h"
 #include "Config.h"
 #include <algorithm>
-#include <cmath>  // std::sqrt, std::min
-#include <thread>
+#include <cmath>
 
-void Physics::Solve(std::span<Object> objects, SpatialGrid& grid, float hw, float hh, float dt) {
-    const int n = (int)objects.size();
+void Physics::ApplyGravity(std::span<Object> objects) {
+    for (auto& obj : objects)
+        obj.ay -= Config::Physics::Gravity;
+}
 
-    for (int step = 0; step < Config::Physics::Substeps; step++) {
-        grid.Clear();
-        for (int i = 0; i < n; i++)
-            grid.Insert(i, objects[i].x, objects[i].y);
-
-        ResolveBoundaries(objects, hw, hh);
-    }
+void Physics::ApplyForce(Object& obj, float fx, float fy) {
+    obj.ax += fx;
+    obj.ay += fy;
 }
 
 void Physics::ResolveBoundaries(std::span<Object> objects, float hw, float hh) {
@@ -27,7 +25,13 @@ void Physics::ResolveBoundaries(std::span<Object> objects, float hw, float hh) {
     }
 }
 
-void Physics::ResolveCell(std::span<Object> objects, SpatialGrid& grid, int col, int row) {
+void Physics::ResolveCollisions(std::span<Object> objects, const SpatialGrid& grid) {
+    for (int row = 0; row < grid.Rows(); row++)
+        for (int col = 0; col < grid.Cols(); col++)
+            ResolveCell(objects, grid, col, row);
+}
+
+void Physics::ResolveCell(std::span<Object> objects, const SpatialGrid& grid, int col, int row) {
     for (int i : grid.GetCell(col, row)) {
         Object& a = objects[i];
         for (int dr = -1; dr <= 1; dr++) {
@@ -41,10 +45,8 @@ void Physics::ResolveCell(std::span<Object> objects, SpatialGrid& grid, int col,
                     float minDist = a.Radius() + b.Radius();
                     if (distSq >= minDist*minDist || distSq < 1e-8f) continue;
 
-                    float dist   = std::sqrt(distSq);
-                    float invD   = 1.0f / dist;
-                    float nx     = dx * invD, ny = dy * invD;
-
+                    float dist = std::sqrt(distSq);
+                    float nx   = dx / dist, ny = dy / dist;
                     float half = (minDist - dist) * 0.5f;
                     a.x -= nx * half; a.y -= ny * half;
                     b.x += nx * half; b.y += ny * half;
@@ -57,15 +59,12 @@ void Physics::ResolveCell(std::span<Object> objects, SpatialGrid& grid, int col,
                     a.vx -= Jn * nx; a.vy -= Jn * ny;
                     b.vx += Jn * nx; b.vy += Jn * ny;
 
-                    float tx = dvx - dvn * nx;
-                    float ty = dvy - dvn * ny;
+                    float tx = dvx - dvn * nx, ty = dvy - dvn * ny;
                     float tvSq = tx*tx + ty*ty;
                     if (tvSq < 1e-8f) continue;
 
                     float tvLen = std::sqrt(tvSq);
-                    float invTv = 1.0f / tvLen;
-                    tx *= invTv; ty *= invTv;
-
+                    tx /= tvLen; ty /= tvLen;
                     float Jt = std::min(tvLen * 0.5f, Config::Physics::Friction * Jn);
                     a.vx += Jt * tx; a.vy += Jt * ty;
                     b.vx -= Jt * tx; b.vy -= Jt * ty;
