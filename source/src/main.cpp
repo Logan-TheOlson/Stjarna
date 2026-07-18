@@ -1,5 +1,4 @@
-#include "Engine.h"
-#include "physics/Physics.h"
+﻿#include "engine/Engine.h"
 #include "Config.h"
 
 void Init() {
@@ -11,9 +10,23 @@ void Init() {
         for (int y = 0; y < 5; y++)
             CreateObject(startX + static_cast<float>(x) * spacing,
                          startY + static_cast<float>(y) * spacing,
-                         Circle{ radius, { 0.2f, 0.6f, 1.0f, 1.0f } });
+                         Renderable{ .color={0.2f, 0.6f, 1.0f, 1.0f}, .shader=Shader::Circle, .geometry=Circle{radius} });
+}
+
+static void ResolveBoundaries() {
+    const float hw = ScreenHalfWidth(), hh = ScreenHalfHeight();
+    for (auto& b : objects) {
+        const float r = b.Radius();
+        if (b.x - r < -hw) { b.x = -hw + r; if (b.vx < 0.0f) b.vx *= -Config::Physics::Restitution; }
+        if (b.x + r >  hw) { b.x =  hw - r; if (b.vx > 0.0f) b.vx *= -Config::Physics::Restitution; }
+        if (b.y - r < -hh) { b.y = -hh + r; if (b.vy < 0.0f) b.vy *= -Config::Physics::Restitution; }
+        if (b.y + r >  hh) { b.y =  hh - r; if (b.vy > 0.0f) b.vy *= -Config::Physics::Restitution; }
+    }
 }
 
 void Update(float) {
-    Physics::ResolveBoundaries(objects, ScreenHalfWidth(), ScreenHalfHeight());
+
+    
+    ResolveBoundaries();
 }
+
