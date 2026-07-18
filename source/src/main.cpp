@@ -15,13 +15,5 @@ void Init() {
 }
 
 void Update(float) {
-
-    Physics::ApplyGravity(objects);
-
     Physics::ResolveBoundaries(objects, ScreenHalfWidth(), ScreenHalfHeight());
-
-    grid.Clear();
-    for (int i = 0; i < static_cast<int>(objects.size()); i++)
-        grid.Insert(i, objects[i].x, objects[i].y);
-    Physics::ResolveCollisions(objects, grid);
 }

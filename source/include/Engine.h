@@ -2,13 +2,11 @@
 #include "Object.h"
 #include "Circle.h"
 #include "Rectangle.h"
-#include "physics/SpatialGrid.h"
 #include <cstddef>
 #include <vector>
 
 // Scene state
 extern std::vector<Object> objects;
-extern SpatialGrid         grid;
 
 // Object management
 Object& CreateObject(float x, float y, Circle shape);

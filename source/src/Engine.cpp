@@ -10,7 +10,6 @@ void Init();
 void Update(float dt);
 
 std::vector<Object> objects;
-SpatialGrid         grid;
 
 static App      app;
 static Profiler profiler;
@@ -51,7 +50,6 @@ int main(int, char**) {
     app.Init(Config::WindowTitle, Config::WindowWidth, Config::WindowHeight);
 
     objects.reserve(100000);
-    grid = SpatialGrid{ app.HalfWidth(), app.HalfHeight(), 2.0f * Config::Defaults::CircleRadius };
 
     Init();
 
