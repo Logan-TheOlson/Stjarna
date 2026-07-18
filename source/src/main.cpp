@@ -25,8 +25,6 @@ static void ResolveBoundaries() {
 }
 
 void Update(float) {
-
-    
     ResolveBoundaries();
 }
 
