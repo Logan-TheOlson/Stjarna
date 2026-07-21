@@ -18,6 +18,6 @@ namespace Config {
         constexpr float Friction    = 0.3f;
         constexpr int   Substeps    = 8;
 
-        constexpr float SmoothingRadius = 15.f;
+        constexpr float SmoothingRadius = 250.f;
     }
 }

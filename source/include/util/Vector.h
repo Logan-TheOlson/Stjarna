@@ -18,6 +18,7 @@ struct Vec2 {
     Vec2& operator*=(float s)         { x *= s;     y *= s;     return *this; }
 };
 
+inline bool operator==(const Vec2& a, const Vec2& b) { return a.x == b.x && a.y == b.y; }
 inline Vec2 operator+(const Vec2& a, const Vec2& b) { return Vec2(a.x + b.x, a.y + b.y); }
 inline Vec2 operator-(const Vec2& a, const Vec2& b) { return Vec2(a.x - b.x, a.y - b.y); }
 inline Vec2 operator*(const Vec2& a, float s)        { return Vec2(a.x * s, a.y * s); }
