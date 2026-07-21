@@ -7,8 +7,9 @@ A barebones 2D simulation engine built on Vulkan + SDL3. Designed to be a minima
 ```
 main.cpp      — your simulation: Init() and Update()
 Engine.cpp    — run loop, integration, object management (internals)
-Physics.cpp   — forces, boundaries, collision resolution
-VulkanContext — instanced GPU rendering of circles and rectangles
+Object.cpp    — per-object radius/draw
+Vector.h/cpp  — Vec2 math (util/)
+VulkanContext — instanced GPU rendering of circles
 ```
 
 ### Frame order
@@ -17,57 +18,75 @@ VulkanContext — instanced GPU rendering of circles and rectangles
 Init()                    called once at startup
 
 each frame:
-  Update(dt)              your code: apply forces, resolve collisions, manage grid
-  Integrate(dt)           engine: substep velocity/position update, resets accelerations
+  Update(dt)              your code: apply forces, resolve boundaries, etc.
+  Integrate(dt)           engine: substep velocity/position update, resets acceleration
   Draw + RenderFrame      engine: GPU submission
 ```
 
 ## User API
 
-Include `Engine.h` and `Physics.h` in `main.cpp`.
+Include `Engine.h` in `main.cpp`.
 
 ### Object management (`Engine.h`)
 
 ```cpp
 extern std::vector<Object> objects;
-extern SpatialGrid         grid;
 
-Object& CreateObject(float x, float y, Circle shape);
-Object& CreateObject(float x, float y, Rectangle shape);
+Object& CreateObject(float x, float y, Renderable r);
 void    RemoveObject(size_t i);          // O(1) swap-with-last
 
 float   ScreenHalfWidth();
 float   ScreenHalfHeight();
 ```
 
-### Physics (`Physics.h`)
+### Object (`Object.h`)
 
 ```cpp
-Physics::ApplyGravity(objects);                              // adds Config::Physics::Gravity to ay
-Physics::ApplyForce(obj, fx, fy);                           // adds to ax/ay
-Physics::ResolveBoundaries(objects, hw, hh);                // clamp + reflect velocity
-Physics::ResolveCollisions(objects, grid);                  // impulse resolution via spatial grid
+struct Object {
+    Vec2       pos;
+    Vec2       vel = Vec2(0, 0);
+    Vec2       acc = Vec2(0, 0);   // net acceleration — reset after each Integrate
+    Renderable renderable;
+
+    float Radius() const;
+};
 ```
 
-### Shapes
+Apply forces in `Update()` by accumulating into `obj.acc` — the engine integrates and clears it for you every frame.
+
+### Vec2 (`util/Vector.h`)
 
 ```cpp
-Circle    { float radius; Color color; }
-Rectangle { float halfW, halfH; Color color; }
-Color     { float r, g, b, a; }        // 0–1
+struct Vec2 { float x, y; };
+
+Vec2 operator+(Vec2, Vec2);
+Vec2 operator-(Vec2, Vec2);
+Vec2 operator*(Vec2, float);   // and float * Vec2
+// += -= *= also available
+
+float distance(Vec2 a, Vec2 b);
+float length(Vec2 a);
+```
+
+### Shapes / Renderable (`Renderable.h`)
+
+```cpp
+Circle     { float radius; }
+Shader     { Circle }                  // which GPU pipeline draws this object
+Renderable { Color color; Shader shader; Circle geometry; }
+Color      { float r, g, b, a; }        // 0–1
 ```
 
 ### Typical Update
 
 ```cpp
 void Update(float dt) {
-    Physics::ApplyGravity(objects);
-    Physics::ResolveBoundaries(objects, ScreenHalfWidth(), ScreenHalfHeight());
-
-    grid.Clear();
-    for (int i = 0; i < (int)objects.size(); i++)
-        grid.Insert(i, objects[i].x, objects[i].y);
-    Physics::ResolveCollisions(objects, grid);
+    for (auto& b : objects) {
+        const float r = b.Radius();
+        // clamp + reflect off screen edges, per axis
+        if (b.pos.x - r < -hw) { b.pos.x = -hw + r; if (b.vel.x < 0.0f) b.vel.x *= -Config::Physics::Restitution; }
+        // ...
+    }
 }
 ```
 
@@ -75,10 +94,10 @@ void Update(float dt) {
 
 ```cpp
 Config::WindowWidth / WindowHeight
-Config::Physics::Gravity        // pixels/s^2
-Config::Physics::Restitution    // bounce coefficient
+Config::Physics::Restitution        // bounce coefficient
 Config::Physics::Friction
-Config::Physics::Substeps       // integration substeps per frame
+Config::Physics::Substeps           // integration substeps per frame
+Config::Physics::SmoothingRadius    // SPH kernel smoothing radius
 ```
 
 ## Dependencies
