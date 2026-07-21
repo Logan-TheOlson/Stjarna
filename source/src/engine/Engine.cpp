@@ -16,7 +16,7 @@ static Profiler profiler;
 static bool     profilerOpen = false;
 
 Object& CreateObject(float x, float y, Renderable r) {
-    objects.push_back({ .x = x, .y = y, .renderable = r });
+    objects.push_back({ .pos = Vec2(x, y), .renderable = r });
     return objects.back();
 }
 
@@ -32,12 +32,10 @@ static void Integrate(float dt) {
     const float subDt = dt / static_cast<float>(Config::Physics::Substeps);
     for (auto& obj : objects) {
         for (int step = 0; step < Config::Physics::Substeps; step++) {
-            obj.vx += obj.ax * subDt;
-            obj.vy += obj.ay * subDt;
-            obj.x  += obj.vx * subDt;
-            obj.y  += obj.vy * subDt;
+            obj.vel += obj.acc * subDt;
+            obj.pos += obj.vel * subDt;
         }
-        obj.ax = obj.ay = 0.0f;
+        obj.acc = Vec2(0.0f, 0.0f);
     }
 }
 

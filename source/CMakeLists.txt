@@ -80,6 +80,7 @@ add_executable(${NAME}
     src/util/Profiler.cpp
     resource.rc
     Stjarna.manifest
+        src/util/Vector.cpp
 )
 
 target_include_directories(${NAME} PRIVATE include)

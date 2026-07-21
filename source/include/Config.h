@@ -1,6 +1,5 @@
 #pragma once
 
-struct Vec2  { float x, y; };
 struct Color { float r, g, b, a; };
 
 namespace Config {
@@ -18,5 +17,7 @@ namespace Config {
         constexpr float Restitution = 0.85f;
         constexpr float Friction    = 0.3f;
         constexpr int   Substeps    = 8;
+
+        constexpr float SmoothingRadius = 15.f;
     }
 }

@@ -7,5 +7,5 @@ float Object::Radius() const {
 
 void Object::Draw(App& app) const {
     if (renderable.shader == Shader::Circle)
-        app.AddCircle(x, y, renderable.geometry.radius, renderable.color);
+        app.AddCircle(pos.x, pos.y, renderable.geometry.radius, renderable.color);
 }
