@@ -13,3 +13,4 @@ struct Object {
     float Radius() const;
     void  Draw(App& app) const;
 };
+
