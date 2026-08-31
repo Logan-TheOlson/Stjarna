@@ -17,7 +17,13 @@ namespace Config {
         constexpr float Restitution = 0.85f;
         constexpr float Friction    = 0.3f;
         constexpr int   Substeps    = 8;
+    }
 
-        constexpr float SmoothingRadius = 250.f;
+    namespace Particles
+    {
+        constexpr float SmoothingRadius = 50.f;
+        constexpr float Stiffness = 2.f;
+        constexpr float RestDensity = 0.003f;
+        constexpr int Exponent = 7;
     }
 }
