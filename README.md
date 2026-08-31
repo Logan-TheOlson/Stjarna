@@ -1,6 +1,6 @@
 # Stjarna
 
-A barebones 2D simulation engine built on Vulkan + SDL3. Designed to be a minimal, modular foundation — the engine handles windowing, rendering, timing, and integration; you fill in `Init()` and `Update()`.
+A barebones 2D simulation engine built on Vulkan + SDL3. Designed to be a minimal, modular foundation — the engine handles windowing, rendering, timing, and integration
 
 ## Architecture
 
