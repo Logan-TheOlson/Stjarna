@@ -65,7 +65,7 @@ Vec2 operator*(Vec2, float);   // and float * Vec2
 // += -= *= also available
 
 float distance(Vec2 a, Vec2 b);
-float length(Vec2 a);
+float magnitude(Vec2 a);
 ```
 
 ### Shapes / Renderable (`Renderable.h`)
@@ -97,7 +97,7 @@ Config::WindowWidth / WindowHeight
 Config::Physics::Restitution        // bounce coefficient
 Config::Physics::Friction
 Config::Physics::Substeps           // integration substeps per frame
-Config::Physics::SmoothingRadius    // SPH kernel smoothing radius
+Config::Particles::SmoothingRadius  // SPH kernel smoothing radius
 ```
 
 ## Dependencies

@@ -23,9 +23,10 @@ inline Vec2 operator+(const Vec2& a, const Vec2& b) { return Vec2(a.x + b.x, a.y
 inline Vec2 operator-(const Vec2& a, const Vec2& b) { return Vec2(a.x - b.x, a.y - b.y); }
 inline Vec2 operator*(const Vec2& a, float s)        { return Vec2(a.x * s, a.y * s); }
 inline Vec2 operator*(float s, const Vec2& a)        { return a * s; }
+inline Vec2 operator/(const Vec2& a, float s)        { return Vec2(a.x / s, a.y / s); }
 
 float distance(const Vec2& a, const Vec2& b);
 
-float length(const Vec2& a);
+float magnitude(const Vec2& a);
 
 #endif //STJARNA_VECTOR_H
