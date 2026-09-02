@@ -4,21 +4,6 @@
 #include "engine/Engine.h"
 #include "Config.h"
 
-// ----------- Boundary limiting
-static void resolveAxis(float& p, float& v, float half, float r) {
-    if (p - r < -half) { p = -half + r; if (v < 0.0f) v *= -Config::Physics::Restitution; }
-    if (p + r >  half) { p =  half - r; if (v > 0.0f) v *= -Config::Physics::Restitution; }
-}
-
-static void ResolveBoundaries() {
-    const float hw = ScreenHalfWidth(), hh = ScreenHalfHeight();
-    for (auto& b : objects) {
-        const float r = b.Radius();
-        resolveAxis(b.pos.x, b.vel.x, hw, r);
-        resolveAxis(b.pos.y, b.vel.y, hh, r);
-    }
-}
-
 // ----------- Kernels
 static float DensityKernel (float radius, float dst) // Poly6-style kernel
 {
@@ -43,7 +28,9 @@ void CalculatePressure (Object& particle) // Calculate pressure
 {
     float frac = Config::Particles::Stiffness * Config::Particles::RestDensity * (1.f / Config::Particles::Exponent);
     float parenth = std::pow(particle.density/Config::Particles::RestDensity, Config::Particles::Exponent) - 1;
-    particle.pressure = frac * parenth;
+    // Clamp negative pressure (density below rest density, e.g. near a free surface) to zero —
+    // otherwise the pressure force below turns attractive instead of just going slack.
+    particle.pressure = std::max(0.f, frac * parenth);
 }
 
 void CalculateDensity (Object& particle) // Calculates local density at a particle
@@ -54,7 +41,8 @@ void CalculateDensity (Object& particle) // Calculates local density at a partic
     {
         float dist = distance(b.pos, particle.pos);
 
-        if (dist == 0.f ){continue;}
+        // A particle's self-term (dist==0) is the kernel's largest single contribution — RestDensity
+        // was calibrated assuming it's included, so skipping it left density at roughly half of target.
         if (dist > Config::Particles::SmoothingRadius){continue;}
 
         particle.density += DensityKernel(Config::Particles::SmoothingRadius, dist);
@@ -66,7 +54,7 @@ void CalculatePressureForce (Object& particle)
     // Floor density before it's used as a divisor — a particle with few/no neighbors
     // (edge, corner, momentarily isolated) can have density near zero without being
     // exactly zero, which would otherwise blow up the 1/density terms below.
-    constexpr float MinDensity = Config::Particles::RestDensity * 0.01f;
+    const float MinDensity = Config::Particles::RestDensity * 0.01f;
 
     Vec2 forceVec(0.f, 0.f);
 
@@ -105,9 +93,6 @@ void Init() {
 }
 
 void Update(float) {
-    // Window Boundaries
-    ResolveBoundaries();
-
     for (auto& b : objects) // For every particle...
     {
         CalculateDensity(b);
@@ -116,6 +101,6 @@ void Update(float) {
     for (auto& b : objects)
     {
         CalculatePressureForce(b);
-        b.acc.y -= Config::Physics::Gravity;
+
     }
 }

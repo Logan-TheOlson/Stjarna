@@ -1,5 +1,4 @@
-﻿#define VOLK_IMPLEMENTATION
-#include <volk/volk.h>
+﻿#include <volk.h>
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_vulkan.h>
 #include "renderer/VulkanContext.h"
@@ -328,6 +327,10 @@ void VulkanContext::RenderFrame() {
         ImGui::Text("render  %6.2f ms", profilerStats_.renderMs);
         ImGui::Separator();
         ImGui::Text("objects %d", objectCount_);
+        ImGui::Separator();
+        // Max pinned to the 2.8e-5 Config.h default (now correctly calibrated with self-density
+        // included) — only room to go lower and see the fluid go slack, not higher/denser.
+        ImGui::SliderFloat("target density", &Config::Particles::RestDensity, 1e-6f, 2.8e-5f, "%.2e");
         ImGui::Separator();
         ImGui::TextDisabled("F1 to close");
         ImGui::End();

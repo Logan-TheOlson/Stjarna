@@ -1,5 +1,5 @@
 ﻿#pragma once
-#include <volk/volk.h>
+#include <volk.h>
 #include <vector>
 #include "Config.h"
 #include "util/Profiler.h"

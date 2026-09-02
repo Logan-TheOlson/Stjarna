@@ -28,14 +28,23 @@ void RemoveObject(size_t i) {
 float ScreenHalfWidth()  { return app.HalfWidth(); }
 float ScreenHalfHeight() { return app.HalfHeight(); }
 
-static void Integrate(float dt) {
-    const float subDt = dt / static_cast<float>(Config::Physics::Substeps);
+static void resolveAxis(float& p, float& v, float half, float r) {
+    if (p - r < -half) { p = -half + r; if (v < 0.0f) v *= -Config::Physics::Restitution; }
+    if (p + r >  half) { p =  half - r; if (v > 0.0f) v *= -Config::Physics::Restitution; }
+}
+
+// Integrates a single substep, reusing whatever force (particle.acc) the last Update() call
+// computed — held constant across Config::Physics::ForceInterval substeps at a time to trade
+// some staleness back for compute cost. acc is reset only when it's about to be recomputed
+// (see the main loop), not here.
+static void Integrate(float subDt) {
+    const float hw = ScreenHalfWidth(), hh = ScreenHalfHeight();
     for (auto& obj : objects) {
-        for (int step = 0; step < Config::Physics::Substeps; step++) {
-            obj.vel += obj.acc * subDt;
-            obj.pos += obj.vel * subDt;
-        }
-        obj.acc = Vec2(0.0f, 0.0f);
+        const float r = obj.Radius();
+        obj.vel += obj.acc * subDt;
+        obj.pos += obj.vel * subDt;
+        resolveAxis(obj.pos.x, obj.vel.x, hw, r);
+        resolveAxis(obj.pos.y, obj.vel.y, hh, r);
     }
 }
 
@@ -60,8 +69,17 @@ int main(int, char**) {
         float dt  = std::min(std::chrono::duration<float>(now - last).count(), 1.0f / 30.0f);
         last      = now;
 
-        Update(dt);
-        Integrate(dt);
+        // Force is recomputed every ForceInterval substeps (not once per frame, not every
+        // substep) — see Integrate()'s comment for why a stale force is a real energy-gain
+        // source, and why recomputing every substep was too expensive at this particle count.
+        const float subDt = dt / static_cast<float>(Config::Physics::Substeps);
+        for (int step = 0; step < Config::Physics::Substeps; step++) {
+            if (step % Config::Physics::ForceInterval == 0) {
+                for (auto& obj : objects) obj.acc = Vec2(0.0f, 0.0f);
+                Update(subDt);
+            }
+            Integrate(subDt);
+        }
         profiler.MarkComputeEnd();
 
         for (auto& obj : objects)

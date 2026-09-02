@@ -10,6 +10,13 @@ FetchContent_Declare(imgui
 )
 FetchContent_MakeAvailable(imgui)
 
+FetchContent_Declare(volk
+    GIT_REPOSITORY https://github.com/zeux/volk
+    GIT_TAG        master
+    GIT_SHALLOW    TRUE
+)
+FetchContent_MakeAvailable(volk)
+
 if (NOT IS_DIRECTORY $ENV{VULKAN_SDK})
     message(WARNING "Vulkan SDK not detected, if installed please set VULKAN_SDK env var or manually provide libraries")
 else()
@@ -19,7 +26,7 @@ endif()
 include_directories(SYSTEM $ENV{VULKAN_SDK}/include)
 
 find_package(Vulkan REQUIRED)
-find_library(SDL_LIBRARY NAMES SDL3 HINTS "$ENV{VULKAN_SDK}/lib" REQUIRED)
+find_library(SDL_LIBRARY NAMES SDL3 HINTS "C:/SDL3/x86_64-w64-mingw32/lib" REQUIRED)
 find_program(GLSLC glslc HINTS "$ENV{VULKAN_SDK}/Bin" "$ENV{VULKAN_SDK}/bin" REQUIRED)
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin/")
 
@@ -56,19 +63,19 @@ add_library(imgui_lib STATIC
     ${imgui_SOURCE_DIR}/backends/imgui_impl_vulkan.cpp
 )
 target_include_directories(imgui_lib PUBLIC
-    ${imgui_SOURCE_DIR}
-    ${imgui_SOURCE_DIR}/backends
-    $ENV{VULKAN_SDK}/include
+        ${imgui_SOURCE_DIR}
+        ${imgui_SOURCE_DIR}/backends
+        ${Vulkan_INCLUDE_DIRS}
 )
 target_compile_definitions(imgui_lib PRIVATE
     IMGUI_IMPL_VULKAN_USE_VOLK
-    "IMGUI_IMPL_VULKAN_VOLK_FILENAME=<volk/volk.h>"
+    "IMGUI_IMPL_VULKAN_VOLK_FILENAME=<volk.h>"
     VK_NO_PROTOTYPES
 )
 if (CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
     target_compile_options(imgui_lib PRIVATE -Wno-stringop-overflow)
 endif()
-target_link_libraries(imgui_lib PRIVATE ${SDL_LIBRARY})
+target_link_libraries(imgui_lib PUBLIC volk PRIVATE ${SDL_LIBRARY})
 
 add_executable(${NAME}
     src/main.cpp
@@ -90,5 +97,5 @@ if (WIN32)
 endif()
 set_target_properties(${NAME} PROPERTIES DEBUGGER_WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
 target_compile_features(${NAME} PRIVATE cxx_std_20)
-target_link_libraries(${NAME} PRIVATE ${SDL_LIBRARY} imgui_lib)
+target_link_libraries(${NAME} PRIVATE ${SDL_LIBRARY} imgui_lib volk)
 add_dependencies(${NAME} Shaders)

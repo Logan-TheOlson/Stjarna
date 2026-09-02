@@ -17,6 +17,9 @@ namespace Config {
         constexpr float Restitution = 0.85f;
         constexpr float Friction    = 0.3f;
         constexpr int   Substeps    = 8;
+        // Recompute density/pressure/force every N substeps instead of every substep — trades
+        // some force staleness back for compute cost. Must divide Substeps evenly.
+        constexpr int   ForceInterval = 4;
     }
 
     namespace Particles
@@ -24,10 +27,11 @@ namespace Config {
         constexpr float SmoothingRadius = 50.f;
         // RestDensity calibrated to the normalized Poly6 kernel at SmoothingRadius=50
         // with the current Init() grid spacing (30px) — recompute if either changes.
-        constexpr float RestDensity = 2.8e-5f;
-        // Starting point for empirical tuning; raise if the fluid compresses too easily,
-        // lower if pressure forces overpower gravity.
-        constexpr float Stiffness = 3000.f;
+        // Non-const so the profiler screen can expose a live "target density" slider.
+        inline float RestDensity = 2.8e-5f;
+        // c_s = sqrt(Stiffness). Raised from 3000 as a moderate step toward the literature
+        // rule (c_s >= 10x max velocity) without yet adding viscosity to damp the impact.
+        constexpr float Stiffness = 12000.f;
         constexpr int Exponent = 7;
     }
 }
