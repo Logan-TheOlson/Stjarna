@@ -4,11 +4,11 @@ struct Color { float r, g, b, a; };
 
 namespace Config {
     constexpr const char* WindowTitle  = "Stjarna";
-    constexpr int         WindowWidth  = 1920;
-    constexpr int         WindowHeight = 1080;
+    constexpr int         WindowWidth  = 2560;
+    constexpr int         WindowHeight = 1440;
 
     namespace Defaults {
-        constexpr float CircleRadius = 10.0f;
+        constexpr float CircleRadius = 5.0f;
         constexpr Color CircleColor  = { 1.0f, 0.5f, 0.1f, 1.0f };
     }
 
@@ -23,10 +23,10 @@ namespace Config {
 
     namespace Particles
     {
-        constexpr float SmoothingRadius = 50.f;
-        // TargetDensity calibrated to the normalized Poly6 kernel at SmoothingRadius=50
-        // with the current Init() grid spacing (30px) — recompute if either changes.
-        constexpr float TargetDensity = 1.75e-5f;
+        constexpr float SmoothingRadius = 25.f;
+        // Calibrated to SmoothingRadius=25 and Init()'s grid spacing (radius*3 = 15px) —
+        // recompute (lattice-sum the Poly6 kernel at the new spacing/radius) if either changes.
+        constexpr float TargetDensity = 1.4e-4f;
         constexpr float Stiffness = 12000.f;
         constexpr int Exponent = 7;
         constexpr float Viscosity = 0.5f;
