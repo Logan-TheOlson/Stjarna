@@ -1,8 +1,53 @@
 ﻿#include <algorithm>
 #include <cmath>
+#include <cstdint>
+#include <unordered_map>
+#include <vector>
 
 #include "engine/Engine.h"
 #include "Config.h"
+
+// ----------- Spatial partitioning
+// Uniform grid, cell width = 2*SmoothingRadius, so every particle within SmoothingRadius of
+// another is guaranteed to be found by checking just the 3x3 block of cells around it — no need
+// to scan all particles like the old O(n^2) loops did.
+struct GridCell { int x, y; bool operator==(const GridCell& o) const { return x == o.x && y == o.y; } };
+struct GridCellHash {
+    size_t operator()(const GridCell& c) const {
+        return std::hash<int64_t>()((static_cast<int64_t>(c.x) << 32) ^ static_cast<uint32_t>(c.y));
+    }
+};
+
+static std::unordered_map<GridCell, std::vector<int>, GridCellHash> grid;
+
+static GridCell CellOf(const Vec2& pos, float cellSize) {
+    return { static_cast<int>(std::floor(pos.x / cellSize)), static_cast<int>(std::floor(pos.y / cellSize)) };
+}
+
+// Rebuilt once per Update() call — cheap after warm-up since the map's bucket vectors are cleared
+// in place (kept allocated) rather than the whole map being torn down and rebuilt every call.
+static void BuildGrid() {
+    for (auto& [cell, bucket] : grid) bucket.clear();
+    const float cellSize = 2.f * Config::Particles::SmoothingRadius;
+    for (int i = 0; i < static_cast<int>(objects.size()); i++)
+        grid[CellOf(objects[i].pos, cellSize)].push_back(i);
+}
+
+// Invokes fn(Object&) for every particle sharing particle's cell or one of its 8 neighbors
+// (including particle itself — callers already handle self-exclusion where it matters).
+template <typename Fn>
+static void ForEachNeighbor(const Object& particle, Fn&& fn) {
+    const float cellSize = 2.f * Config::Particles::SmoothingRadius;
+    const GridCell base = CellOf(particle.pos, cellSize);
+    for (int dx = -1; dx <= 1; dx++) {
+        for (int dy = -1; dy <= 1; dy++) {
+            auto it = grid.find({ base.x + dx, base.y + dy });
+            if (it == grid.end()) continue;
+            for (int idx : it->second)
+                fn(objects[idx]);
+        }
+    }
+}
 
 // ----------- Kernels
 static float DensityKernel (float radius, float dst) // Poly6-style kernel
@@ -17,7 +62,7 @@ static float PressureKernelGradient (float radius, float dst) // 'Spiky' Kernel 
 {
     // (radius - dst)^3 is the pressure kernel, but we only need the gradient for use in pressure accumulation
 
-    if (dst >= radius) return 0.f; // removes particles outside smoothing radius TODO: Spatial Partitioning
+    if (dst >= radius) return 0.f; // removes particles outside smoothing radius
     constexpr float pi = 3.14159265358979323846f;
     float normalization = -45.f / (pi * std::pow(radius, 6));
     return normalization * (radius - dst) * (radius - dst);
@@ -37,50 +82,48 @@ static void CalculateDensity (Object& particle) // Calculates local density at a
 {
     particle.density = 0.f;
 
-    for (auto& b : objects)
-    {
+    ForEachNeighbor(particle, [&](Object& b) {
         float dist = distance(b.pos, particle.pos);
 
         // A particle's self-term (dist==0) is the kernel's largest single contribution — TargetDensity
         // was calibrated assuming it's included, so skipping it left density at roughly half of target.
-        if (dist > Config::Particles::SmoothingRadius){continue;}
+        if (dist > Config::Particles::SmoothingRadius) return;
 
         particle.density += DensityKernel(Config::Particles::SmoothingRadius, dist);
-    }
+    });
 }
 
 static void CalculatePressureForce (Object& particle)
 {
-    // Floor density before it's used as a divisor — a particle with few/no neighbors
-    // (edge, corner, momentarily isolated) can have density near zero without being
-    // exactly zero, which would otherwise blow up the 1/density terms below.
     constexpr float MinDensity = Config::Particles::TargetDensity * 0.01f;
 
     const float pDensity = std::max(particle.density, MinDensity);
     Vec2 forceVec(0.f, 0.f);
 
-    for (auto& b : objects)
-    {
-        if (&b == &particle) continue;
+    ForEachNeighbor(particle, [&](Object& b) {
+        if (&b == &particle) return;
 
-       Vec2 difference = particle.pos - b.pos;
+        Vec2 difference = particle.pos - b.pos;
         float dist = magnitude(difference);
-        if (dist == 0.f ) continue;
+        if (dist == 0.f ) return;
         Vec2 dir = difference / dist;
 
         float grad = PressureKernelGradient(Config::Particles::SmoothingRadius, dist);
         float bDensity = std::max(b.density, MinDensity);
-
-        // Standard SPH momentum equation: F_i = -sum_j (P_i/rho_i^2 + P_j/rho_j^2) * gradW_ij.
-        // The old (P_i+P_j)/(2*rho_i*rho_j) weighting was momentum-conserving (antisymmetric by
-        // construction) but NOT energy-conserving — it only equals this form when rho_i==rho_j,
-        // and diverges whenever densities differ, which is most of the time in a real fluid. This
-        // specific per-particle 1/rho^2 weighting is what's actually derivable from the SPH energy
-        // functional; confirmed via a live kinetic-energy readout that climbed every collision
-        // even after ruling out force staleness as the cause.
         float coefficient = particle.pressure / (pDensity * pDensity) + b.pressure / (bDensity * bDensity);
+
+        Vec2 velDiff = particle.vel - b.vel;
+        float approach = dot(velDiff, difference);
+        if (approach < 0.f) {
+            const float h  = Config::Particles::SmoothingRadius;
+            const float mu = h * approach / (dist * dist + 0.01f * h * h);
+            const float avgDensity = (pDensity + bDensity) * 0.5f;
+            const float soundSpeed = std::sqrt(Config::Particles::Stiffness);
+            coefficient += -Config::Particles::Viscosity * soundSpeed * mu / avgDensity;
+        }
+
         forceVec -= dir * (grad * coefficient);
-    }
+    });
 
     particle.acc += forceVec;
 }
@@ -101,6 +144,8 @@ void Init() {
 }
 
 void Update(float) {
+    BuildGrid();
+
     for (auto& b : objects) // For every particle...
     {
         CalculateDensity(b);
@@ -109,5 +154,6 @@ void Update(float) {
     for (auto& b : objects)
     {
         CalculatePressureForce(b);
+        b.acc.y -= Config::Physics::Gravity;
     }
 }
