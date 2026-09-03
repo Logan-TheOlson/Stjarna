@@ -20,15 +20,15 @@ namespace Config {
         // Recompute density/pressure/force every N substeps instead of every substep — trades
         // some force staleness back for compute cost. Must divide Substeps evenly.
         constexpr int   ForceInterval = 4;
+        static_assert(Substeps % ForceInterval == 0, "ForceInterval must divide Substeps evenly");
     }
 
     namespace Particles
     {
         constexpr float SmoothingRadius = 50.f;
-        // RestDensity calibrated to the normalized Poly6 kernel at SmoothingRadius=50
+        // TargetDensity calibrated to the normalized Poly6 kernel at SmoothingRadius=50
         // with the current Init() grid spacing (30px) — recompute if either changes.
-        // Non-const so the profiler screen can expose a live "target density" slider.
-        inline float RestDensity = 2.8e-5f;
+        constexpr float TargetDensity = 1.75e-5f;
         // c_s = sqrt(Stiffness). Raised from 3000 as a moderate step toward the literature
         // rule (c_s >= 10x max velocity) without yet adding viscosity to damp the impact.
         constexpr float Stiffness = 12000.f;

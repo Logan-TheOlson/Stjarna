@@ -26,7 +26,8 @@ endif()
 include_directories(SYSTEM $ENV{VULKAN_SDK}/include)
 
 find_package(Vulkan REQUIRED)
-find_library(SDL_LIBRARY NAMES SDL3 HINTS "C:/SDL3/x86_64-w64-mingw32/lib" REQUIRED)
+set(SDL3_ROOT "C:/SDL3/x86_64-w64-mingw32" CACHE PATH "Root directory of the SDL3 SDK (containing lib/)")
+find_library(SDL_LIBRARY NAMES SDL3 HINTS "${SDL3_ROOT}/lib" REQUIRED)
 find_program(GLSLC glslc HINTS "$ENV{VULKAN_SDK}/Bin" "$ENV{VULKAN_SDK}/bin" REQUIRED)
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin/")
 

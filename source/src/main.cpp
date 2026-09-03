@@ -24,16 +24,16 @@ static float PressureKernelGradient (float radius, float dst) // 'Spiky' Kernel 
 }
 
 // --------- Calculations
-void CalculatePressure (Object& particle) // Calculate pressure
+static void CalculatePressure (Object& particle) // Calculate pressure
 {
-    float frac = Config::Particles::Stiffness * Config::Particles::RestDensity * (1.f / Config::Particles::Exponent);
-    float parenth = std::pow(particle.density/Config::Particles::RestDensity, Config::Particles::Exponent) - 1;
-    // Clamp negative pressure (density below rest density, e.g. near a free surface) to zero —
+    float frac = Config::Particles::Stiffness * Config::Particles::TargetDensity * (1.f / Config::Particles::Exponent);
+    float parenth = std::pow(particle.density/Config::Particles::TargetDensity, Config::Particles::Exponent) - 1;
+    // Clamp negative pressure (density below target density, e.g. near a free surface) to zero —
     // otherwise the pressure force below turns attractive instead of just going slack.
     particle.pressure = std::max(0.f, frac * parenth);
 }
 
-void CalculateDensity (Object& particle) // Calculates local density at a particle
+static void CalculateDensity (Object& particle) // Calculates local density at a particle
 {
     particle.density = 0.f;
 
@@ -41,7 +41,7 @@ void CalculateDensity (Object& particle) // Calculates local density at a partic
     {
         float dist = distance(b.pos, particle.pos);
 
-        // A particle's self-term (dist==0) is the kernel's largest single contribution — RestDensity
+        // A particle's self-term (dist==0) is the kernel's largest single contribution — TargetDensity
         // was calibrated assuming it's included, so skipping it left density at roughly half of target.
         if (dist > Config::Particles::SmoothingRadius){continue;}
 
@@ -49,12 +49,12 @@ void CalculateDensity (Object& particle) // Calculates local density at a partic
     }
 }
 
-void CalculatePressureForce (Object& particle)
+static void CalculatePressureForce (Object& particle)
 {
     // Floor density before it's used as a divisor — a particle with few/no neighbors
     // (edge, corner, momentarily isolated) can have density near zero without being
     // exactly zero, which would otherwise blow up the 1/density terms below.
-    const float MinDensity = Config::Particles::RestDensity * 0.01f;
+    constexpr float MinDensity = Config::Particles::TargetDensity * 0.01f;
 
     Vec2 forceVec(0.f, 0.f);
 
@@ -81,12 +81,13 @@ void CalculatePressureForce (Object& particle)
 // ------------- Simulation
 void Init() {
     // Sets Up sim
-    constexpr float radius  = Config::Defaults::CircleRadius;
-    constexpr float spacing = radius * 3.0f;
-    constexpr float startX  = -(4 * spacing / 2.0f);
-    constexpr float startY  = -(4 * spacing / 2.0f);
-    for (int x = 0; x < 20; x++)
-        for (int y = 0; y < 20; y++)
+    constexpr int   gridCount = 20;
+    constexpr float radius    = Config::Defaults::CircleRadius;
+    constexpr float spacing   = radius * 3.0f;
+    constexpr float startX    = -((gridCount - 1) * spacing / 2.0f);
+    constexpr float startY    = -((gridCount - 1) * spacing / 2.0f);
+    for (int x = 0; x < gridCount; x++)
+        for (int y = 0; y < gridCount; y++)
             CreateObject(startX + static_cast<float>(x) * spacing,
                          startY + static_cast<float>(y) * spacing,
                          Renderable{ .color={0.2f, 0.6f, 1.0f, 1.0f}, .shader=Shader::Circle, .geometry=Circle{radius} });
@@ -101,6 +102,5 @@ void Update(float) {
     for (auto& b : objects)
     {
         CalculatePressureForce(b);
-
     }
 }

@@ -328,10 +328,6 @@ void VulkanContext::RenderFrame() {
         ImGui::Separator();
         ImGui::Text("objects %d", objectCount_);
         ImGui::Separator();
-        // Max pinned to the 2.8e-5 Config.h default (now correctly calibrated with self-density
-        // included) — only room to go lower and see the fluid go slack, not higher/denser.
-        ImGui::SliderFloat("target density", &Config::Particles::RestDensity, 1e-6f, 2.8e-5f, "%.2e");
-        ImGui::Separator();
         ImGui::TextDisabled("F1 to close");
         ImGui::End();
     }
