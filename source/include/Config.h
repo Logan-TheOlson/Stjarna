@@ -8,7 +8,7 @@ namespace Config {
     constexpr int         WindowHeight = 1440;
 
     namespace Defaults {
-        constexpr float CircleRadius = 5.0f;
+        constexpr float CircleRadius = 2.5f;
         constexpr Color CircleColor  = { 1.0f, 0.5f, 0.1f, 1.0f };
     }
 
@@ -23,10 +23,10 @@ namespace Config {
 
     namespace Particles
     {
-        constexpr float SmoothingRadius = 25.f;
-        // Calibrated to SmoothingRadius=25 and Init()'s grid spacing (radius*3 = 15px) —
+        constexpr float SmoothingRadius = 12.5f;
+        // Calibrated to SmoothingRadius=12.5 and Init()'s grid spacing (radius*3 = 7.5px) —
         // recompute (lattice-sum the Poly6 kernel at the new spacing/radius) if either changes.
-        constexpr float TargetDensity = 1.4e-4f;
+        constexpr float TargetDensity = 1.12e-3f;
         constexpr float Stiffness = 12000.f;
         constexpr int Exponent = 7;
         constexpr float Viscosity = 0.5f;

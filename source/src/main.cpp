@@ -203,8 +203,7 @@ static void CalculatePressure (int32_t k) // Calculate pressure
 {
     float frac = Config::Particles::Stiffness * Config::Particles::TargetDensity * (1.f / Config::Particles::Exponent);
     float parenth = IntPow(hotDensity[k] / Config::Particles::TargetDensity, Config::Particles::Exponent) - 1;
-    // Clamp negative pressure (density below target, e.g. near a free surface) to zero — otherwise
-    // the pressure force below turns attractive instead of just going slack.
+    // Clamp negative pressure so that it is never attractive
     hotPressure[k] = std::max(0.f, frac * parenth);
 }
 
@@ -269,7 +268,6 @@ static void CalculatePressureForce (int32_t k)
     });
 
     // No self-exclusion: a particle right at the wall does feel a force from its own mirror image
-    // — that's what makes this act as a boundary condition rather than just a density correction.
     ForEachGhost(pos, [&](const Ghost& g) {
         accumulate(g.pos, g.vel, hotDensity[g.src], hotPressure[g.src]);
     });
@@ -279,11 +277,9 @@ static void CalculatePressureForce (int32_t k)
 
 // ------------- Simulation
 void Init() {
-    // 125x80 = 10,000 — close to this window's non-overlapping capacity at this spacing, so it
-    // stays stable without a violent initial compression.
     constexpr float radius     = Config::Defaults::CircleRadius;
     constexpr float spacing    = radius * 3.0f;
-    constexpr int   gridCountX = 125, gridCountY = 80;
+    constexpr int   gridCountX = 200, gridCountY = 125; // 25,000
     constexpr float startX     = -((gridCountX - 1) * spacing / 2.0f);
     constexpr float startY     = -((gridCountY - 1) * spacing / 2.0f);
     for (int x = 0; x < gridCountX; x++)
@@ -298,7 +294,7 @@ void Update(float) {
 
     const int32_t n = static_cast<int32_t>(hotPos.size());
 
-    // Each k writes only its own hot slot, so these are race-free; ParallelFor blocks until a
+    // Each k writes only its own hot slot, so these are datarace-free; ParallelFor blocks until a
     // call's chunks all finish, so density/pressure are fully settled before the force pass reads them.
     ParallelFor(n, [](int32_t begin, int32_t end) {
         for (int32_t k = begin; k < end; k++) { CalculateDensity(k); CalculatePressure(k); }
