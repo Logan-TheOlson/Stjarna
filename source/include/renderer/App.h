@@ -14,6 +14,7 @@ public:
     void SetProfilerOpen(bool open)                 { vk.SetProfilerOpen(open); }
     void SetProfilerStats(const Profiler::Stats& s) { vk.SetProfilerStats(s); }
     void SetObjectCount(int n)                      { vk.SetObjectCount(n); }
+    void SetKineticEnergy(float ke)                 { vk.SetKineticEnergy(ke); }
     int   Width()      const;
     int   Height()     const;
     float HalfWidth()  const;

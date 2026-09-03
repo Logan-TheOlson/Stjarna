@@ -16,6 +16,7 @@ public:
     void SetProfilerOpen(bool open)                 { profilerOpen_ = open; }
     void SetProfilerStats(const Profiler::Stats& s) { profilerStats_ = s; }
     void SetObjectCount(int n)                      { objectCount_ = n; }
+    void SetKineticEnergy(float ke)                 { kineticEnergy_ = ke; }
     int   Width()      const { return (int)swapchainExtent.width; }
     int   Height()     const { return (int)swapchainExtent.height; }
     float HalfWidth()  const { return swapchainExtent.width  * 0.5f; }
@@ -73,6 +74,7 @@ private:
     bool            profilerOpen_{ false };
     Profiler::Stats profilerStats_{};
     int             objectCount_{ 0 };
+    float           kineticEnergy_{ 0.f };
 
     void CreateSwapchain();
     void RecreateSwapchain();

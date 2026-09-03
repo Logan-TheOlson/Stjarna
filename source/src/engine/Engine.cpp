@@ -88,6 +88,12 @@ int main(int, char**) {
         app.RenderFrame();
         profiler.MarkRenderEnd();
         app.SetObjectCount(static_cast<int>(objects.size()));
+
+        float kineticEnergy = 0.f;
+        for (auto& obj : objects)
+            kineticEnergy += 0.5f * (obj.vel.x * obj.vel.x + obj.vel.y * obj.vel.y);
+        app.SetKineticEnergy(kineticEnergy);
+
         if (profiler.Tick())
             app.SetProfilerStats(profiler.GetStats());
 

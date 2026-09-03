@@ -56,6 +56,7 @@ static void CalculatePressureForce (Object& particle)
     // exactly zero, which would otherwise blow up the 1/density terms below.
     constexpr float MinDensity = Config::Particles::TargetDensity * 0.01f;
 
+    const float pDensity = std::max(particle.density, MinDensity);
     Vec2 forceVec(0.f, 0.f);
 
     for (auto& b : objects)
@@ -68,14 +69,20 @@ static void CalculatePressureForce (Object& particle)
         Vec2 dir = difference / dist;
 
         float grad = PressureKernelGradient(Config::Particles::SmoothingRadius, dist);
-        float sharedPressure = (particle.pressure + b.pressure) / 2.f;
         float bDensity = std::max(b.density, MinDensity);
 
-        forceVec -= dir * (grad * sharedPressure / bDensity);
+        // Standard SPH momentum equation: F_i = -sum_j (P_i/rho_i^2 + P_j/rho_j^2) * gradW_ij.
+        // The old (P_i+P_j)/(2*rho_i*rho_j) weighting was momentum-conserving (antisymmetric by
+        // construction) but NOT energy-conserving — it only equals this form when rho_i==rho_j,
+        // and diverges whenever densities differ, which is most of the time in a real fluid. This
+        // specific per-particle 1/rho^2 weighting is what's actually derivable from the SPH energy
+        // functional; confirmed via a live kinetic-energy readout that climbed every collision
+        // even after ruling out force staleness as the cause.
+        float coefficient = particle.pressure / (pDensity * pDensity) + b.pressure / (bDensity * bDensity);
+        forceVec -= dir * (grad * coefficient);
     }
 
-    float pDensity = std::max(particle.density, MinDensity);
-    particle.acc += forceVec / pDensity;
+    particle.acc += forceVec;
 }
 
 // ------------- Simulation

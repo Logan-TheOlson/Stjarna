@@ -328,6 +328,11 @@ void VulkanContext::RenderFrame() {
         ImGui::Separator();
         ImGui::Text("objects %d", objectCount_);
         ImGui::Separator();
+        // Total system kinetic energy (mass=1 per particle) — watch this during collisions to
+        // check whether it's just oscillating (expected, undamped) or trending upward (a real
+        // energy-injection bug, e.g. stale force reuse across substeps).
+        ImGui::Text("KE %.1f", kineticEnergy_);
+        ImGui::Separator();
         ImGui::TextDisabled("F1 to close");
         ImGui::End();
     }

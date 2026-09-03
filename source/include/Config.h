@@ -17,9 +17,12 @@ namespace Config {
         constexpr float Restitution = 0.85f;
         constexpr float Friction    = 0.3f;
         constexpr int   Substeps    = 8;
-        // Recompute density/pressure/force every N substeps instead of every substep — trades
-        // some force staleness back for compute cost. Must divide Substeps evenly.
-        constexpr int   ForceInterval = 4;
+        // Recompute density/pressure/force every N substeps instead of every substep. Was 4 as a
+        // compute-cost compromise, but the total system kinetic energy was confirmed (via the
+        // profiler's KE readout) to climb monotonically with any staleness here — a stale force
+        // keeps pushing a separating pair after the true force has already dropped off, injecting
+        // real energy every collision. Must divide Substeps evenly.
+        constexpr int   ForceInterval = 1;
         static_assert(Substeps % ForceInterval == 0, "ForceInterval must divide Substeps evenly");
     }
 
