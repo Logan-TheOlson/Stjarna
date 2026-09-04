@@ -332,6 +332,9 @@ void VulkanContext::RenderFrame() {
         // check whether it's just oscillating (expected, undamped) or trending upward (a real
         // energy-injection bug, e.g. stale force reuse across substeps).
         ImGui::Text("KE %.1f", kineticEnergy_);
+        if (totalEnergyValid_) ImGui::Text("E  %.1f", totalEnergy_);
+        ImGui::Separator();
+        ImGui::SliderFloat("Time Scale", &timeScale_, 0.f, 10.f, "%.2fx");
         ImGui::Separator();
         ImGui::TextDisabled("F1 to close");
         ImGui::End();

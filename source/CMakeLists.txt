@@ -87,9 +87,12 @@ add_executable(${NAME}
     src/renderer/VulkanContext.cpp
     src/util/Profiler.cpp
     src/util/ThreadPool.cpp
+    src/util/Vector.cpp
+    src/physics/Quadtree.cpp
+    src/physics/Gravity.cpp
+    src/physics/FMM.cpp
     resource.rc
     Stjarna.manifest
-        src/util/Vector.cpp
 )
 
 target_include_directories(${NAME} PRIVATE include)

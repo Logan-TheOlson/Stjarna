@@ -1,6 +1,7 @@
 ﻿#include "engine/Engine.h"
 #include "renderer/App.h"
 #include "util/Profiler.h"
+#include "physics/Gravity.h"
 #include "Config.h"
 #include <algorithm>
 #include <chrono>
@@ -55,6 +56,7 @@ int main(int, char**) {
         auto  now = Clock::now();
         float dt  = std::min(std::chrono::duration<float>(now - last).count(), 1.0f / 30.0f);
         last      = now;
+        dt *= app.TimeScale();
 
         const float subDt = dt / static_cast<float>(Config::Physics::Substeps);
         for (int step = 0; step < Config::Physics::Substeps; step++) {
@@ -77,6 +79,16 @@ int main(int, char**) {
         for (auto& obj : objects)
             kineticEnergy += 0.5f * (obj.vel.x * obj.vel.x + obj.vel.y * obj.vel.y);
         app.SetKineticEnergy(kineticEnergy);
+
+        if (objects.size() <= Config::Debug::EnergyMonitorMaxParticles) {
+            std::vector<Vec2> pos;
+            pos.reserve(objects.size());
+            for (auto& obj : objects) pos.push_back(obj.pos);
+            const float potentialEnergy = Gravity::DirectSumPotentialEnergy(pos, static_cast<int32_t>(pos.size()));
+            app.SetTotalEnergy(kineticEnergy + potentialEnergy, true);
+        } else {
+            app.SetTotalEnergy(0.f, false);
+        }
 
         if (profiler.Tick())
             app.SetProfilerStats(profiler.GetStats());

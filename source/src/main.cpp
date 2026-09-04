@@ -6,6 +6,9 @@
 
 #include "engine/Engine.h"
 #include "Config.h"
+#include "physics/FMM.h"
+#include "physics/Gravity.h"
+#include "physics/Quadtree.h"
 #include "util/ThreadPool.h"
 
 namespace {
@@ -16,7 +19,7 @@ namespace {
     std::vector<int32_t>  rawCellX, rawCellY;
     std::vector<uint32_t> rawHash;
 
-    std::vector<Vec2>    hotPos, hotVel, hotForce;
+    std::vector<Vec2>    hotPos, hotVel, hotForce, hotGravAcc;
     std::vector<float>   hotDensity, hotPressure;
     std::vector<int32_t> hotToReal;
     std::vector<int32_t> cellX, cellY;
@@ -64,6 +67,7 @@ static void BuildGrid() {
     hotDensity.resize(n);
     hotPressure.resize(n);
     hotForce.resize(n);
+    hotGravAcc.resize(n);
 
     cursor.assign(cellStart.begin(), cellStart.end() - 1);
     for (int32_t i = 0; i < n; i++) {
@@ -195,9 +199,28 @@ static void CalculatePressureForce (int32_t k)
     hotForce[k] = forceVec;
 }
 
-void Init() {
+static void InitKeplerTest() {
     constexpr float radius = Config::Defaults::CircleRadius;
-    constexpr int   n      = 15000;
+    constexpr float d      = Config::Debug::KeplerSeparation * 0.5f;
+
+    // Circular mutual orbit: m*v^2/d == G*m^2/r^2 with r = 2d, so v = sqrt(G*m / (2*r)).
+    const float v = std::sqrt(Config::Physics::G * Config::Physics::ParticleMass / (2.f * Config::Debug::KeplerSeparation));
+
+    Object& a = CreateObject(-d, 0.f, Renderable{ .color={0.2f, 0.6f, 1.0f, 1.0f}, .shader=Shader::Circle, .geometry=Circle{radius} });
+    a.vel = Vec2(0.f, v);
+
+    Object& b = CreateObject(d, 0.f, Renderable{ .color={1.0f, 0.6f, 0.2f, 1.0f}, .shader=Shader::Circle, .geometry=Circle{radius} });
+    b.vel = Vec2(0.f, -v);
+}
+
+void Init() {
+    if constexpr (Config::Debug::KeplerTestEnabled) {
+        InitKeplerTest();
+        return;
+    }
+
+    constexpr float radius = Config::Defaults::CircleRadius;
+    constexpr int   n      = 10000;
 
     std::mt19937 rng{ std::random_device{}() };
     std::uniform_real_distribution<float> spawnX(-ScreenHalfWidth(),  ScreenHalfWidth());
@@ -221,13 +244,29 @@ void Update(float) {
         for (int32_t k = begin; k < end; k++) CalculatePressureForce(k);
     });
 
-    constexpr float OmegaSq = Config::Physics::Omega * Config::Physics::Omega;
+    if constexpr (Config::Physics::UseFMM) {
+        Gravity::BuildQuadtree(hotPos, n);
+        Gravity::ComputeMultipoles(hotPos);
+        Gravity::EvaluateFMM(hotPos, n, hotGravAcc);
+        if constexpr (Config::Physics::ValidateFMM) {
+            Gravity::ValidateFMMAccuracy(hotPos, n, 500);
+        }
+    } else {
+        Gravity::BuildTree(hotPos, n);
+        ParallelFor(n, [](int32_t begin, int32_t end) {
+            for (int32_t k = begin; k < end; k++) hotGravAcc[k] = Gravity::EvaluateForce(k, hotPos);
+        });
+        if constexpr (Config::Physics::ValidateGravity) {
+            Gravity::ValidateAccuracy(hotPos, n, 500);
+        }
+    }
+
     for (int32_t k = 0; k < n; k++) {
         Object& o = objects[hotToReal[k]];
         o.density   = hotDensity[k];
         o.pressure  = hotPressure[k];
         o.acc      += hotForce[k];
-        o.acc      -= o.pos * OmegaSq;
+        o.acc      += hotGravAcc[k];
         o.renderable.color = DensityToColor(hotDensity[k]);
     }
 }
