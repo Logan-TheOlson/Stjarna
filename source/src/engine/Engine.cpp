@@ -1,4 +1,5 @@
 ﻿#include "engine/Engine.h"
+#include "engine/Scene.h"
 #include "renderer/App.h"
 #include "util/Profiler.h"
 #include "Config.h"
@@ -62,6 +63,7 @@ struct MenuConfig {
     char  title[128] = "capture";
     int   fps = 60;
     float lengthSeconds = 10.f;
+    int   sceneIndex = 0;
 };
 static MenuConfig menuConfig;
 
@@ -75,6 +77,7 @@ static void ResetSimulation() {
 }
 
 static void StartSimulationFromMenu() {
+    LoadScene(ScenePresets[menuConfig.sceneIndex]);
     ResetSimulation();
     if (menuConfig.record)
         app.StartRecording(menuConfig.title, menuConfig.fps, menuConfig.lengthSeconds);
@@ -102,6 +105,19 @@ static void DrawMenu() {
     ImGui::TextUnformatted("SPH Fluid Simulation");
     ImGui::Separator();
 
+    const Scene& selectedScene = ScenePresets[menuConfig.sceneIndex];
+    if (ImGui::BeginCombo("Scene", selectedScene.name)) {
+        for (int i = 0; i < static_cast<int>(ScenePresets.size()); i++) {
+            const bool isSelected = (i == menuConfig.sceneIndex);
+            if (ImGui::Selectable(ScenePresets[i].name, isSelected))
+                menuConfig.sceneIndex = i;
+            if (isSelected) ImGui::SetItemDefaultFocus();
+        }
+        ImGui::EndCombo();
+    }
+    ImGui::TextWrapped("%s", selectedScene.description);
+
+    ImGui::Separator();
     ImGui::Checkbox("Record to video", &menuConfig.record);
     if (menuConfig.record) {
         ImGui::InputText("Title", menuConfig.title, sizeof(menuConfig.title));
@@ -127,6 +143,8 @@ static void DrawRunningOverlay() {
         ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize |
         ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoNav);
 
+    ImGui::TextDisabled("%s", ActiveScene.name);
+
     if (app.IsRecording())
         ImGui::TextColored(ImVec4(1.0f, 0.3f, 0.3f, 1.0f), "REC %.1fs", app.RecordedSeconds());
 
@@ -147,21 +165,36 @@ void RemoveObject(size_t i) {
     objects.pop_back();
 }
 
-float ScreenHalfWidth()  { return app.HalfWidth(); }
-float ScreenHalfHeight() { return app.HalfHeight(); }
+// The simulation container's half-extents — the active scene's boundary fractions applied to the
+// actual window size, so a scene can request walls closer in than the window edge.
+float ScreenHalfWidth()  { return app.HalfWidth()  * ActiveScene.boundary.widthFrac; }
+float ScreenHalfHeight() { return app.HalfHeight() * ActiveScene.boundary.heightFrac; }
+
+// Draws a black frame at the active scene's boundary, so a container narrower than the window
+// (see SceneBoundary) reads as a wall instead of an invisible line partway across the screen.
+// AddRectOutline's border band is drawn inward from the half-extent passed in, so the rect is
+// inflated by BorderThickness here — that puts the band entirely outside the wall (half-extent
+// stays exactly where particles clamp) instead of eating into the fluid's play area.
+static void DrawBoundary(App& app) {
+    constexpr float BorderThickness = 6.0f;
+    constexpr Color BorderColor     = { 0.f, 0.f, 0.f, 1.f };
+    app.AddRectOutline(0.f, 0.f, ScreenHalfWidth() + BorderThickness, ScreenHalfHeight() + BorderThickness,
+                        BorderThickness, BorderColor);
+}
 
 // vt is the velocity component tangential to this axis's wall (e.g. vel.y when resolving the
-// x-axis walls); when NoSlipWalls is enabled it gets damped on contact instead of passing
+// x-axis walls); when noSlipWalls is enabled it gets damped on contact instead of passing
 // through untouched, so wall-adjacent particles drag against the boundary rather than free-slip.
 static void resolveAxis(float& p, float& v, float& vt, float half, float r) {
+    const auto& physics = ActiveScene.physics;
     bool hit = false;
-    if (p - r < -half) { p = -half + r; if (v < 0.0f) { v *= -Config::Physics::Restitution; hit = true; } }
-    if (p + r >  half) { p =  half - r; if (v > 0.0f) { v *= -Config::Physics::Restitution; hit = true; } }
-    if (hit && Config::Physics::NoSlipWalls) vt *= 1.0f - Config::Physics::Friction;
+    if (p - r < -half) { p = -half + r; if (v < 0.0f) { v *= -physics.restitution; hit = true; } }
+    if (p + r >  half) { p =  half - r; if (v > 0.0f) { v *= -physics.restitution; hit = true; } }
+    if (hit && physics.noSlipWalls) vt *= 1.0f - physics.friction;
 }
 
 // Integrates a single substep, reusing whatever force (particle.acc) the last Update() call
-// computed — held constant across Config::Physics::ForceInterval substeps at a time to trade
+// computed — held constant across ActiveScene.physics.forceInterval substeps at a time to trade
 // some staleness back for compute cost. acc is reset only when it's about to be recomputed
 // (see the main loop), not here.
 static void Integrate(float subDt) {
@@ -203,12 +236,13 @@ int main(int, char**) {
         last      = now;
 
         if (appState == AppState::Running) {
-            // Force is recomputed every ForceInterval substeps (not once per frame, not every
+            const auto& physics = ActiveScene.physics;
+            // Force is recomputed every forceInterval substeps (not once per frame, not every
             // substep) — see Integrate()'s comment for why a stale force is a real energy-gain
             // source, and why recomputing every substep was too expensive at this particle count.
-            const float subDt = dt / static_cast<float>(Config::Physics::Substeps);
-            for (int step = 0; step < Config::Physics::Substeps; step++) {
-                if (step % Config::Physics::ForceInterval == 0) {
+            const float subDt = dt / static_cast<float>(physics.substeps);
+            for (int step = 0; step < physics.substeps; step++) {
+                if (step % physics.forceInterval == 0) {
                     for (auto& obj : objects) obj.acc = Vec2(0.0f, 0.0f);
                     Update(subDt);
                 }
@@ -219,6 +253,7 @@ int main(int, char**) {
 
         for (auto& obj : objects)
             obj.Draw(app);
+        if (appState == AppState::Running) DrawBoundary(app);
 
         app.RenderFrame(dt);
         profiler.MarkRenderEnd();

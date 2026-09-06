@@ -35,6 +35,9 @@ bool App::StartRecording(const std::string& title, int fps, float lengthSeconds)
 }
 
 void App::AddCircle(float cx, float cy, float radius, Color color) { vk.AddCircle(cx, cy, radius, color); }
+void App::AddRectOutline(float cx, float cy, float halfWidth, float halfHeight, float borderThickness, Color color) {
+    vk.AddRectOutline(cx, cy, halfWidth, halfHeight, borderThickness, color);
+}
 int   App::Width()      const { return vk.Width(); }
 int   App::Height()     const { return vk.Height(); }
 float App::HalfWidth()  const { return vk.HalfWidth(); }

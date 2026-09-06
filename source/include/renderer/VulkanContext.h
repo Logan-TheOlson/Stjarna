@@ -15,6 +15,9 @@ public:
     bool Init(SDL_Window* window);
     void InitImGui(SDL_Window* window);
     void AddCircle(float cx, float cy, float radius, Color color);
+    // Draws a hollow rectangular frame (border), `borderThickness` pixels wide, centered at
+    // (cx, cy) with the given half-extents — used for boundary markers, not particles.
+    void AddRectOutline(float cx, float cy, float halfWidth, float halfHeight, float borderThickness, Color color);
     void RenderFrame(float dt);
     void Shutdown();
     void SetProfilerOpen(bool open)                 { profilerOpen_ = open; }
@@ -45,7 +48,18 @@ private:
     };
     static_assert(sizeof(CircleData) == 32);
 
+    // SSBO instance data for the hollow-frame rect shader (see shaders/rect.vert/.frag).
+    struct RectData {
+        float r, g, b, a;             // vec4 color  — offset  0
+        float cx, cy;                 // vec2 rect.xy — offset 16
+        float halfWidth, halfHeight;  // vec2 rect.zw — offset 24
+        float borderThickness;        //               offset 32
+        float _pad0, _pad1, _pad2;    //               offset 36..44, total 48
+    };
+    static_assert(sizeof(RectData) == 48);
+
     static constexpr uint32_t kMaxObjects = 100000;
+    static constexpr uint32_t kMaxRects   = 64;
 
     SDL_Window*      sdlWindow{ nullptr };
 
@@ -74,15 +88,24 @@ private:
     VkDescriptorSetLayout shapeDescSetLayout{ VK_NULL_HANDLE };
     VkDescriptorPool      descPool{ VK_NULL_HANDLE };
     VkDescriptorSet       circleDescSet{ VK_NULL_HANDLE };
+    VkDescriptorSet       rectDescSet{ VK_NULL_HANDLE };
 
     VkBuffer       circleSSBO{ VK_NULL_HANDLE };
     VkDeviceMemory circleSSBOMemory{ VK_NULL_HANDLE };
     void*          circleMapped{ nullptr };
 
+    VkBuffer       rectSSBO{ VK_NULL_HANDLE };
+    VkDeviceMemory rectSSBOMemory{ VK_NULL_HANDLE };
+    void*          rectMapped{ nullptr };
+
     VkPipelineLayout circlePipelineLayout{ VK_NULL_HANDLE };
     VkPipeline       circlePipeline{ VK_NULL_HANDLE };
 
+    VkPipelineLayout rectPipelineLayout{ VK_NULL_HANDLE };
+    VkPipeline       rectPipeline{ VK_NULL_HANDLE };
+
     std::vector<CircleData> circles;
+    std::vector<RectData>   rects;
 
     bool            profilerOpen_{ false };
     Profiler::Stats profilerStats_{};

@@ -4,6 +4,7 @@
 #include <vector>
 
 #include "engine/Engine.h"
+#include "engine/Scene.h"
 #include "Config.h"
 #include "util/ThreadPool.h"
 
@@ -19,9 +20,11 @@
 // The table is unbounded, so cells can collide in the hash; cellX/cellY reject false positives so
 // a collision only wastes a candidate rather than double-counting one.
 namespace {
-    constexpr float Radius   = Config::Particles::SmoothingRadius;
-    constexpr float RadiusSq = Radius * Radius;
-    constexpr float CellSize = 2.f * Radius;
+    // Derived from ActiveScene.particles; recomputed by RecomputeSphConstants() whenever a scene
+    // is loaded, not per-frame, so the hot loop still just reads a plain float.
+    float Radius   = 0.f;
+    float RadiusSq = 0.f;
+    float CellSize = 0.f;
 
     std::vector<int32_t>  rawCellX, rawCellY;   // per real particle, scratch for BuildGrid
     std::vector<uint32_t> rawHash;
@@ -157,15 +160,29 @@ static void ForEachGhost(const Vec2& pos, Fn&& fn) {
 
 // ----------- Kernels
 namespace {
-    constexpr float Pi        = 3.14159265358979323846f;
+    constexpr float Pi = 3.14159265358979323846f;
+    // Derived from Radius/RadiusSq (and Stiffness) by RecomputeSphConstants(); computed once per
+    // scene load rather than per neighbor pair.
+    float DensityNorm      = 0.f;
+    float PressureGradNorm = 0.f;
+    float SoundSpeed       = 0.f;
+}
+
+// Recomputes every SPH constant derived from ActiveScene.particles. Called by LoadScene()
+// whenever a new scene is applied — never per-frame, so the hot loop below just reads plain
+// floats instead of paying for std::pow/std::sqrt or a scene-struct indirection per particle pair.
+void RecomputeSphConstants() {
+    Radius   = ActiveScene.particles.smoothingRadius;
+    RadiusSq = Radius * Radius;
+    CellSize = 2.f * Radius;
+
     // radius^6 / radius^9, expanded by hand since std::pow isn't constexpr — turns a std::pow
     // call on every particle pair into a plain multiply against a value computed once.
-    constexpr float Radius6   = RadiusSq * RadiusSq * RadiusSq;
-    constexpr float Radius9   = Radius6 * RadiusSq * Radius;
-    constexpr float DensityNorm      = 315.f / (64.f * Pi * Radius9);
-    constexpr float PressureGradNorm = -45.f / (Pi * Radius6);
-    // Stiffness is constexpr but std::sqrt isn't; computed once instead of per neighbor pair.
-    const     float SoundSpeed = std::sqrt(Config::Particles::Stiffness);
+    const float radius6 = RadiusSq * RadiusSq * RadiusSq;
+    const float radius9 = radius6 * RadiusSq * Radius;
+    DensityNorm      = 315.f / (64.f * Pi * radius9);
+    PressureGradNorm = -45.f / (Pi * radius6);
+    SoundSpeed       = std::sqrt(ActiveScene.particles.stiffness);
 }
 
 // Poly6-style kernel. Takes squared distance directly — callers already have it, and the kernel
@@ -201,8 +218,9 @@ static float IntPow (float base, int exp)
 
 static void CalculatePressure (int32_t k) // Calculate pressure
 {
-    float frac = Config::Particles::Stiffness * Config::Particles::TargetDensity * (1.f / Config::Particles::Exponent);
-    float parenth = IntPow(hotDensity[k] / Config::Particles::TargetDensity, Config::Particles::Exponent) - 1;
+    const auto& p = ActiveScene.particles;
+    float frac = p.stiffness * p.targetDensity * (1.f / p.exponent);
+    float parenth = IntPow(hotDensity[k] / p.targetDensity, p.exponent) - 1;
     // Clamp negative pressure so that it is never attractive
     hotPressure[k] = std::max(0.f, frac * parenth);
 }
@@ -228,7 +246,8 @@ static void CalculateDensity (int32_t k) // Calculates local density at a partic
 
 static void CalculatePressureForce (int32_t k)
 {
-    constexpr float MinDensity = Config::Particles::TargetDensity * 0.01f;
+    const auto& p = ActiveScene.particles;
+    const float MinDensity = p.targetDensity * 0.01f;
 
     const Vec2  pos       = hotPos[k];
     const Vec2  vel       = hotVel[k];
@@ -256,8 +275,8 @@ static void CalculatePressureForce (int32_t k)
         if (approach < 0.f) {
             const float mu = Radius * approach / (distSq + 0.01f * RadiusSq);
             const float avgDensity = (pDensity + bDensity) * 0.5f;
-            coefficient += (-Config::Particles::Viscosity * SoundSpeed * mu
-                             + Config::Particles::ViscosityQuadratic * mu * mu) / avgDensity;
+            coefficient += (-p.viscosity * SoundSpeed * mu
+                             + p.viscosityQuadratic * mu * mu) / avgDensity;
         }
 
         forceVec -= dir * (grad * coefficient);
@@ -278,16 +297,35 @@ static void CalculatePressureForce (int32_t k)
 
 // ------------- Simulation
 void Init() {
-    constexpr float radius     = Config::Defaults::CircleRadius;
-    constexpr float spacing    = radius * 3.0f;
-    constexpr int   gridCountX = 100, gridCountY = 125; // 12,500
-    constexpr float startX     = -((gridCountX - 1) * spacing / 2.0f);
-    constexpr float startY     = -((gridCountY - 1) * spacing / 2.0f);
-    for (int x = 0; x < gridCountX; x++)
-        for (int y = 0; y < gridCountY; y++)
-            CreateObject(startX + static_cast<float>(x) * spacing,
-                         startY + static_cast<float>(y) * spacing,
-                         Renderable{ .color={0.2f, 0.6f, 1.0f, 1.0f}, .shader=Shader::Circle, .geometry=Circle{radius} });
+    const auto& particles = ActiveScene.particles;
+    const auto& spawn     = ActiveScene.spawn;
+
+    const float radius  = particles.circleRadius;
+    const float spacing = radius * 3.0f;
+    const float centerX = spawn.offsetXFrac * ScreenHalfWidth();
+    const float startX  = centerX - (spawn.gridCountX - 1) * spacing / 2.0f;
+    const float startY  = -(spawn.gridCountY - 1) * spacing / 2.0f;
+
+    auto spawnAt = [&](float x, float y) {
+        CreateObject(x, y, Renderable{ .color = particles.circleColor, .shader = Shader::Circle, .geometry = Circle{radius} });
+    };
+
+    if (spawn.circular) {
+        // A circle inscribed in the gridCountX x gridCountY block, sampled on the same lattice.
+        const float halfW = (spawn.gridCountX - 1) * spacing / 2.0f;
+        const float halfH = (spawn.gridCountY - 1) * spacing / 2.0f;
+        const float rSq   = std::min(halfW, halfH) * std::min(halfW, halfH);
+        for (int x = 0; x < spawn.gridCountX; x++)
+            for (int y = 0; y < spawn.gridCountY; y++) {
+                const float px = startX + static_cast<float>(x) * spacing;
+                const float py = startY + static_cast<float>(y) * spacing;
+                if ((px - centerX) * (px - centerX) + py * py <= rSq) spawnAt(px, py);
+            }
+    } else {
+        for (int x = 0; x < spawn.gridCountX; x++)
+            for (int y = 0; y < spawn.gridCountY; y++)
+                spawnAt(startX + static_cast<float>(x) * spacing, startY + static_cast<float>(y) * spacing);
+    }
 }
 
 void Update(float) {
@@ -305,11 +343,12 @@ void Update(float) {
     });
 
     // Scatter hot results back onto the real objects.
+    const float gravity = ActiveScene.physics.gravity;
     for (int32_t k = 0; k < n; k++) {
         Object& o = objects[hotToReal[k]];
         o.density   = hotDensity[k];
         o.pressure  = hotPressure[k];
         o.acc      += hotForce[k];
-        o.acc.y    -= Config::Physics::Gravity;
+        o.acc.y    -= gravity;
     }
 }

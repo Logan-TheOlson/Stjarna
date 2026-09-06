@@ -12,6 +12,7 @@ public:
     void RenderFrame(float dt);
     void Shutdown();
     void AddCircle(float cx, float cy, float radius, Color color);
+    void AddRectOutline(float cx, float cy, float halfWidth, float halfHeight, float borderThickness, Color color);
     bool TakeF1Toggle()                             { return window.TakeF1Toggle(); }
     void SetProfilerOpen(bool open)                 { vk.SetProfilerOpen(open); }
     void SetProfilerStats(const Profiler::Stats& s) { vk.SetProfilerStats(s); }

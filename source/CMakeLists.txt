@@ -41,8 +41,17 @@ add_custom_command(
     DEPENDS ${SHADER_DIR}/circle.vert ${SHADER_DIR}/circle.frag
     VERBATIM
 )
+add_custom_command(
+    OUTPUT  ${SHADER_OUT}/rect.vert.spv ${SHADER_OUT}/rect.frag.spv
+    COMMAND ${CMAKE_COMMAND} -E make_directory ${SHADER_OUT}
+    COMMAND ${GLSLC} ${SHADER_DIR}/rect.vert -o ${SHADER_OUT}/rect.vert.spv
+    COMMAND ${GLSLC} ${SHADER_DIR}/rect.frag -o ${SHADER_OUT}/rect.frag.spv
+    DEPENDS ${SHADER_DIR}/rect.vert ${SHADER_DIR}/rect.frag
+    VERBATIM
+)
 add_custom_target(Shaders DEPENDS
     ${SHADER_OUT}/circle.vert.spv ${SHADER_OUT}/circle.frag.spv
+    ${SHADER_OUT}/rect.vert.spv ${SHADER_OUT}/rect.frag.spv
 )
 
 if (WIN32)
@@ -82,6 +91,7 @@ add_executable(${NAME}
     src/main.cpp
     src/engine/Engine.cpp
     src/engine/Object.cpp
+    src/engine/Scene.cpp
     src/renderer/App.cpp
     src/renderer/Window.cpp
     src/renderer/VulkanContext.cpp

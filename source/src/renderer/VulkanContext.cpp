@@ -107,17 +107,22 @@ bool VulkanContext::Init(SDL_Window* window) {
     chk(vkCreateDescriptorSetLayout(device, &dslCI, nullptr, &shapeDescSetLayout));
 
     CreateShapePipeline("circle.vert.spv", "circle.frag.spv", shapeDescSetLayout, circlePipelineLayout, circlePipeline);
+    CreateShapePipeline("rect.vert.spv", "rect.frag.spv", shapeDescSetLayout, rectPipelineLayout, rectPipeline);
 
-    // SSBO â€” persistently mapped, host-visible + coherent
+    // SSBOs â€” persistently mapped, host-visible + coherent
     const VkDeviceSize circleSSBOSize = kMaxObjects * sizeof(CircleData);
     CreateSSBO(circleSSBOSize, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
                circleSSBO, circleSSBOMemory, circleMapped);
+    const VkDeviceSize rectSSBOSize = kMaxRects * sizeof(RectData);
+    CreateSSBO(rectSSBOSize, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+               rectSSBO, rectSSBOMemory, rectMapped);
 
-    // Descriptor pool + set
-    VkDescriptorPoolSize poolSize{ .type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 1 };
+    // Descriptor pool + sets — one storage-buffer descriptor set each for circles and rects,
+    // sharing shapeDescSetLayout since both are just "one SSBO at binding 0".
+    VkDescriptorPoolSize poolSize{ .type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 2 };
     VkDescriptorPoolCreateInfo poolCI{
         .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
-        .maxSets = 1, .poolSizeCount = 1, .pPoolSizes = &poolSize,
+        .maxSets = 2, .poolSizeCount = 1, .pPoolSizes = &poolSize,
     };
     chk(vkCreateDescriptorPool(device, &poolCI, nullptr, &descPool));
 
@@ -126,10 +131,15 @@ bool VulkanContext::Init(SDL_Window* window) {
         .descriptorPool = descPool, .descriptorSetCount = 1, .pSetLayouts = &shapeDescSetLayout,
     };
     chk(vkAllocateDescriptorSets(device, &dsAllocInfo, &circleDescSet));
+    chk(vkAllocateDescriptorSets(device, &dsAllocInfo, &rectDescSet));
 
     VkDescriptorBufferInfo circleBI{ .buffer = circleSSBO, .offset = 0, .range = VK_WHOLE_SIZE };
-    VkWriteDescriptorSet write{ .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = circleDescSet, .dstBinding = 0, .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .pBufferInfo = &circleBI };
-    vkUpdateDescriptorSets(device, 1, &write, 0, nullptr);
+    VkDescriptorBufferInfo rectBI{ .buffer = rectSSBO, .offset = 0, .range = VK_WHOLE_SIZE };
+    VkWriteDescriptorSet writes[2]{
+        { .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = circleDescSet, .dstBinding = 0, .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .pBufferInfo = &circleBI },
+        { .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = rectDescSet,   .dstBinding = 0, .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .pBufferInfo = &rectBI },
+    };
+    vkUpdateDescriptorSets(device, 2, writes, 0, nullptr);
 
     VkCommandPoolCreateInfo cpCI{ .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO, .flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT, .queueFamilyIndex = queueFamily };
     chk(vkCreateCommandPool(device, &cpCI, nullptr, &commandPool));
@@ -143,6 +153,7 @@ bool VulkanContext::Init(SDL_Window* window) {
     chk(vkCreateFence(device, &fenceCI, nullptr, &fence));
 
     circles.reserve(kMaxObjects);
+    rects.reserve(kMaxRects);
     return true;
 }
 
@@ -323,6 +334,11 @@ void VulkanContext::AddCircle(float cx, float cy, float radius, Color color) {
     circles.push_back({ color.r, color.g, color.b, color.a, cx, cy, radius, 0.0f });
 }
 
+void VulkanContext::AddRectOutline(float cx, float cy, float halfWidth, float halfHeight, float borderThickness, Color color) {
+    if (rects.size() >= kMaxRects) return;
+    rects.push_back({ color.r, color.g, color.b, color.a, cx, cy, halfWidth, halfHeight, borderThickness, 0.f, 0.f, 0.f });
+}
+
 bool VulkanContext::StartRecording(const std::string& outputPath, int fps, float lengthSeconds) {
     if (recorder_.IsActive()) StopRecording();
 
@@ -440,7 +456,7 @@ void VulkanContext::RenderFrame(float dt) {
 
     uint32_t imageIndex = 0;
     VkResult acq = vkAcquireNextImageKHR(device, swapchain, UINT64_MAX, acquireSem, VK_NULL_HANDLE, &imageIndex);
-    if (acq == VK_ERROR_OUT_OF_DATE_KHR || acq == VK_SUBOPTIMAL_KHR) { RecreateSwapchain(); circles.clear(); return; }
+    if (acq == VK_ERROR_OUT_OF_DATE_KHR || acq == VK_SUBOPTIMAL_KHR) { RecreateSwapchain(); circles.clear(); rects.clear(); return; }
     if (acq != VK_SUCCESS) chk(acq);
 
     // Paces captured frames against real elapsed time (dt) rather than the render loop's actual
@@ -508,12 +524,22 @@ void VulkanContext::RenderFrame(float dt) {
             vkCmdPushConstants(cb, circlePipelineLayout, VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(invScreen), invScreen);
             vkCmdDraw(cb, 6, n, 0, 0);
         }
+
+        if (!rects.empty()) {
+            const uint32_t n = (uint32_t)rects.size();
+            memcpy(rectMapped, rects.data(), n * sizeof(RectData));
+            vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, rectPipeline);
+            vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, rectPipelineLayout, 0, 1, &rectDescSet, 0, nullptr);
+            vkCmdPushConstants(cb, rectPipelineLayout, VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(invScreen), invScreen);
+            vkCmdDraw(cb, 6, n, 0, 0);
+        }
     }
 
     ImGui_ImplVulkan_RenderDrawData(ImGui::GetDrawData(), cb);
 
     vkCmdEndRendering(cb);
     circles.clear();
+    rects.clear();
 
     if (capturingThisFrame) {
         VkImageMemoryBarrier toTransferSrc{
@@ -575,6 +601,11 @@ void VulkanContext::Shutdown() {
     vkUnmapMemory(device, circleSSBOMemory);
     vkDestroyBuffer(device, circleSSBO, nullptr);
     vkFreeMemory(device, circleSSBOMemory, nullptr);
+    vkDestroyPipeline(device, rectPipeline, nullptr);
+    vkDestroyPipelineLayout(device, rectPipelineLayout, nullptr);
+    vkUnmapMemory(device, rectSSBOMemory);
+    vkDestroyBuffer(device, rectSSBO, nullptr);
+    vkFreeMemory(device, rectSSBOMemory, nullptr);
     vkDestroyDescriptorPool(device, descPool, nullptr);
     vkDestroyDescriptorSetLayout(device, shapeDescSetLayout, nullptr);
     vkDestroyFence(device, fence, nullptr);
