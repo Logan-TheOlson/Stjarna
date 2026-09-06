@@ -256,7 +256,8 @@ static void CalculatePressureForce (int32_t k)
         if (approach < 0.f) {
             const float mu = Radius * approach / (distSq + 0.01f * RadiusSq);
             const float avgDensity = (pDensity + bDensity) * 0.5f;
-            coefficient += -Config::Particles::Viscosity * SoundSpeed * mu / avgDensity;
+            coefficient += (-Config::Particles::Viscosity * SoundSpeed * mu
+                             + Config::Particles::ViscosityQuadratic * mu * mu) / avgDensity;
         }
 
         forceVec -= dir * (grad * coefficient);
@@ -279,7 +280,7 @@ static void CalculatePressureForce (int32_t k)
 void Init() {
     constexpr float radius     = Config::Defaults::CircleRadius;
     constexpr float spacing    = radius * 3.0f;
-    constexpr int   gridCountX = 200, gridCountY = 125; // 25,000
+    constexpr int   gridCountX = 100, gridCountY = 125; // 12,500
     constexpr float startX     = -((gridCountX - 1) * spacing / 2.0f);
     constexpr float startY     = -((gridCountY - 1) * spacing / 2.0f);
     for (int x = 0; x < gridCountX; x++)

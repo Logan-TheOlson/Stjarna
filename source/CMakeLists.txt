@@ -87,6 +87,7 @@ add_executable(${NAME}
     src/renderer/VulkanContext.cpp
     src/util/Profiler.cpp
     src/util/ThreadPool.cpp
+    src/util/Recorder.cpp
     resource.rc
     Stjarna.manifest
         src/util/Vector.cpp
