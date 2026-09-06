@@ -17,6 +17,9 @@ public:
     void SetKineticEnergy(float ke)                 { vk.SetKineticEnergy(ke); }
     void SetTotalEnergy(float e, bool valid)        { vk.SetTotalEnergy(e, valid); }
     float TimeScale() const                         { return vk.TimeScale(); }
+    void EnableCapture(bool enabled)                { vk.EnableCapture(enabled); }
+    const void* CapturedPixelData() const           { return vk.CapturedPixelData(); }
+    size_t      CapturedPixelDataSize() const       { return vk.CapturedPixelDataSize(); }
     int   Width()      const;
     int   Height()     const;
     float HalfWidth()  const;

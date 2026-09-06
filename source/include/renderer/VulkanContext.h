@@ -24,6 +24,16 @@ public:
     float HalfWidth()  const { return swapchainExtent.width  * 0.5f; }
     float HalfHeight() const { return swapchainExtent.height * 0.5f; }
 
+    // Precompute-mode frame readback: when enabled, RenderFrame() additionally
+    // copies the just-rendered swapchain image into a CPU-visible staging
+    // buffer and blocks until that copy completes, so the raw BGRA8 pixels are
+    // safely readable via CapturedPixelData() immediately after RenderFrame()
+    // returns. Off by default (adds a blocking wait per frame) — only meant
+    // for the offline video-export path, not the interactive one.
+    void EnableCapture(bool enabled);
+    const void* CapturedPixelData() const     { return captureMapped_; }
+    size_t      CapturedPixelDataSize() const { return static_cast<size_t>(swapchainExtent.width) * swapchainExtent.height * 4; }
+
 private:
     // SSBO instance data â€” world-space coords; NDC computed in vertex shader via push constants
     struct CircleData {
@@ -81,10 +91,15 @@ private:
     bool            totalEnergyValid_{ false };
     float           timeScale_{ 1.f };
 
+    bool            captureEnabled_{ false };
+    VkBuffer        captureBuffer_{ VK_NULL_HANDLE };
+    VkDeviceMemory  captureMemory_{ VK_NULL_HANDLE };
+    void*           captureMapped_{ nullptr };
+
     void CreateSwapchain();
     void RecreateSwapchain();
     void CreateShapePipeline(const char* vertSpv, const char* fragSpv,
                              VkDescriptorSetLayout descSetLayout,
                              VkPipelineLayout& outLayout, VkPipeline& outPipeline);
-    void CreateSSBO(VkDeviceSize size, VkBuffer& buf, VkDeviceMemory& mem, void*& mapped);
+    void CreateHostBuffer(VkDeviceSize size, VkBufferUsageFlags usage, VkBuffer& buf, VkDeviceMemory& mem, void*& mapped);
 };

@@ -2,10 +2,13 @@
 
 #include <array>
 #include <cmath>
+#include <mutex>
+#include <utility>
 
 #include "Config.h"
 #include "physics/Combinatorics.h"
 #include "physics/Quadtree.h"
+#include "util/ThreadPool.h"
 
 // Cartesian Taylor-expansion FMM for the softened 1/r Newtonian kernel.
 // The multipole (P2M/M2M), M2L, L2L formulas and the force sign were all
@@ -33,11 +36,6 @@ namespace {
 
     // std::array (not a raw double[][]) so std::vector<LocalTable> can assign/fill it.
     using LocalTable = std::array<std::array<double, P + 1>, P + 1>;
-
-    std::vector<LocalTable> localExp; // per-node local expansion, rebuilt each EvaluateFMM call
-
-    const std::vector<Vec2>* g_pos    = nullptr;
-    std::vector<Vec2>*        g_accel = nullptr;
 
     double Pow(double base, int exp) {
         double result = 1.0;
@@ -142,32 +140,44 @@ namespace {
         }
     }
 
-    void ApplyPairForce(int32_t pi, int32_t pj) {
-        const Vec2  d   = (*g_pos)[pi] - (*g_pos)[pj];
+    // Bundles the per-call mutable state DualTraverse writes into. Passed by
+    // reference through the recursion instead of using shared globals so that
+    // separate top-level branches can be run on separate threads, each with
+    // its own private ctx (see EvaluateFMM), and merged afterward — the tree
+    // itself (`nodes`/`particleIndex`) is read-only during traversal so needs
+    // no such duplication.
+    struct TraverseCtx {
+        const std::vector<Vec2>* pos;
+        std::vector<Vec2>*        accel;    // near-field (P2P) contributions
+        std::vector<LocalTable>*  localExp; // far-field (M2L) contributions, per node
+    };
+
+    void ApplyPairForce(TraverseCtx& ctx, int32_t pi, int32_t pj) {
+        const Vec2  d   = (*ctx.pos)[pi] - (*ctx.pos)[pj];
         const float r2  = dot(d, d) + static_cast<float>(Eps2);
         const float invR3 = 1.f / (r2 * std::sqrt(r2));
         const Vec2  f   = (static_cast<float>(G * Mass)) * d * invR3;
-        (*g_accel)[pi] -= f;
-        (*g_accel)[pj] += f;
+        (*ctx.accel)[pi] -= f;
+        (*ctx.accel)[pj] += f;
     }
 
-    void LeafSelfP2P(int32_t a) {
+    void LeafSelfP2P(TraverseCtx& ctx, int32_t a) {
         const QuadNode& A = nodes[a];
         for (int32_t i = 0; i < A.particleCount; i++) {
             const int32_t pi = particleIndex[A.particleStart + i];
             for (int32_t j = i + 1; j < A.particleCount; j++) {
-                ApplyPairForce(pi, particleIndex[A.particleStart + j]);
+                ApplyPairForce(ctx, pi, particleIndex[A.particleStart + j]);
             }
         }
     }
 
-    void LeafPairP2P(int32_t a, int32_t b) {
+    void LeafPairP2P(TraverseCtx& ctx, int32_t a, int32_t b) {
         const QuadNode& A = nodes[a];
         const QuadNode& B = nodes[b];
         for (int32_t i = 0; i < A.particleCount; i++) {
             const int32_t pi = particleIndex[A.particleStart + i];
             for (int32_t j = 0; j < B.particleCount; j++) {
-                ApplyPairForce(pi, particleIndex[B.particleStart + j]);
+                ApplyPairForce(ctx, pi, particleIndex[B.particleStart + j]);
             }
         }
     }
@@ -176,17 +186,17 @@ namespace {
     // are well-separated (accumulate M2L into both sides' local expansions),
     // both leaves and too close (direct P2P), or one side gets refined into
     // its children and we recurse.
-    void DualTraverse(int32_t a, int32_t b) {
+    void DualTraverse(TraverseCtx& ctx, int32_t a, int32_t b) {
         const QuadNode& A = nodes[a];
         const QuadNode& B = nodes[b];
 
         if (a == b) {
             if (A.childStart < 0) {
-                LeafSelfP2P(a);
+                LeafSelfP2P(ctx, a);
             } else {
                 for (int32_t i = 0; i < 4; i++)
                     for (int32_t j = i; j < 4; j++)
-                        DualTraverse(A.childStart + i, A.childStart + j);
+                        DualTraverse(ctx, A.childStart + i, A.childStart + j);
             }
             return;
         }
@@ -206,26 +216,36 @@ namespace {
             double DTab[DOrder + 1][DOrder + 1];
             const Vec2 Rab = B.center - A.center;
             ComputeDTable(Rab.x, Rab.y, DTab);
-            M2L(A.multipole, DTab, localExp[b]);
+            M2L(A.multipole, DTab, (*ctx.localExp)[b]);
 
             const Vec2 Rba = A.center - B.center;
             ComputeDTable(Rba.x, Rba.y, DTab);
-            M2L(B.multipole, DTab, localExp[a]);
+            M2L(B.multipole, DTab, (*ctx.localExp)[a]);
             return;
         }
 
         const bool aLeaf = A.childStart < 0;
         const bool bLeaf = B.childStart < 0;
         if (aLeaf && bLeaf) {
-            LeafPairP2P(a, b);
+            LeafPairP2P(ctx, a, b);
             return;
         }
 
         if (bLeaf || (!aLeaf && A.halfSize >= B.halfSize)) {
-            for (int32_t i = 0; i < 4; i++) DualTraverse(A.childStart + i, b);
+            for (int32_t i = 0; i < 4; i++) DualTraverse(ctx, A.childStart + i, b);
         } else {
-            for (int32_t j = 0; j < 4; j++) DualTraverse(a, B.childStart + j);
+            for (int32_t j = 0; j < 4; j++) DualTraverse(ctx, a, B.childStart + j);
         }
+    }
+
+    void MergeInto(std::vector<LocalTable>& dstLocal, std::vector<Vec2>& dstAccel,
+                   const std::vector<LocalTable>& srcLocal, const std::vector<Vec2>& srcAccel) {
+        for (size_t ni = 0; ni < dstLocal.size(); ni++)
+            for (int j = 0; j <= P; j++)
+                for (int k = 0; k + j <= P; k++)
+                    dstLocal[ni][j][k] += srcLocal[ni][j][k];
+        for (size_t pi = 0; pi < dstAccel.size(); pi++)
+            dstAccel[pi] += srcAccel[pi];
     }
 }
 
@@ -233,12 +253,40 @@ void EvaluateFMM(const std::vector<Vec2>& pos, int32_t n, std::vector<Vec2>& out
     outAccel.assign(n, Vec2(0.f, 0.f));
     if (nodes.empty()) return;
 
-    localExp.assign(nodes.size(), LocalTable{});
+    std::vector<LocalTable> localExp(nodes.size(), LocalTable{});
 
-    g_pos   = &pos;
-    g_accel = &outAccel;
+    const QuadNode& root = nodes[0];
+    if (root.childStart < 0) {
+        // Small enough that root never split: nothing meaningful to parallelize.
+        TraverseCtx ctx{ &pos, &outAccel, &localExp };
+        DualTraverse(ctx, 0, 0);
+    } else {
+        // Enumerate the same 10 (i<=j) pairs among root's children that the
+        // a==b branch of DualTraverse would otherwise expand serially, and run
+        // them on separate threads. Different pairs can recurse into and write
+        // the same descendant node's local expansion (e.g. pairs (0,1) and
+        // (0,2) both touch child 0's subtree), so each chunk accumulates into
+        // its own private localExp/accel copy and results are summed after —
+        // safe because M2L/P2P contributions are purely additive.
+        std::vector<std::pair<int32_t, int32_t>> pairs;
+        pairs.reserve(10);
+        for (int32_t i = 0; i < 4; i++)
+            for (int32_t j = i; j < 4; j++)
+                pairs.emplace_back(root.childStart + i, root.childStart + j);
 
-    DualTraverse(0, 0);
+        std::mutex mergeMutex;
+        ParallelFor(static_cast<int32_t>(pairs.size()), [&](int32_t begin, int32_t end) {
+            std::vector<LocalTable> localScratch(nodes.size(), LocalTable{});
+            std::vector<Vec2>       accelScratch(n, Vec2(0.f, 0.f));
+            TraverseCtx ctx{ &pos, &accelScratch, &localScratch };
+
+            for (int32_t idx = begin; idx < end; idx++)
+                DualTraverse(ctx, pairs[idx].first, pairs[idx].second);
+
+            std::lock_guard<std::mutex> lock(mergeMutex);
+            MergeInto(localExp, outAccel, localScratch, accelScratch);
+        });
+    }
 
     // Top-down L2L: parent index is always smaller than any child's (see
     // BuildQuadtree), so a single forward scan already finalizes every

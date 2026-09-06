@@ -110,7 +110,7 @@ bool VulkanContext::Init(SDL_Window* window) {
 
     // SSBO â€” persistently mapped, host-visible + coherent
     const VkDeviceSize circleSSBOSize = kMaxObjects * sizeof(CircleData);
-    CreateSSBO(circleSSBOSize, circleSSBO, circleSSBOMemory, circleMapped);
+    CreateHostBuffer(circleSSBOSize, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, circleSSBO, circleSSBOMemory, circleMapped);
 
     // Descriptor pool + set
     VkDescriptorPoolSize poolSize{ .type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 1 };
@@ -269,11 +269,11 @@ void VulkanContext::CreateShapePipeline(const char* vertSpv, const char* fragSpv
     vkDestroyShaderModule(device, fragMod, nullptr);
 }
 
-void VulkanContext::CreateSSBO(VkDeviceSize size, VkBuffer& buf, VkDeviceMemory& mem, void*& mapped) {
+void VulkanContext::CreateHostBuffer(VkDeviceSize size, VkBufferUsageFlags usage, VkBuffer& buf, VkDeviceMemory& mem, void*& mapped) {
     VkBufferCreateInfo bCI{
         .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
         .size = size,
-        .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+        .usage = usage,
         .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
     };
     chk(vkCreateBuffer(device, &bCI, nullptr, &buf));
@@ -291,7 +291,7 @@ void VulkanContext::CreateSSBO(VkDeviceSize size, VkBuffer& buf, VkDeviceMemory&
             memTypeIndex = i; break;
         }
     }
-    if (memTypeIndex == UINT32_MAX) { std::cerr << "No suitable memory type for SSBO\n"; exit(1); }
+    if (memTypeIndex == UINT32_MAX) { std::cerr << "No suitable host-visible memory type\n"; exit(1); }
 
     VkMemoryAllocateInfo allocInfo{
         .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
@@ -301,6 +301,25 @@ void VulkanContext::CreateSSBO(VkDeviceSize size, VkBuffer& buf, VkDeviceMemory&
     chk(vkAllocateMemory(device, &allocInfo, nullptr, &mem));
     chk(vkBindBufferMemory(device, buf, mem, 0));
     chk(vkMapMemory(device, mem, 0, VK_WHOLE_SIZE, 0, &mapped));
+}
+
+void VulkanContext::EnableCapture(bool enabled) {
+    if (enabled == captureEnabled_) return;
+
+    if (enabled) {
+        vkDeviceWaitIdle(device);
+        const VkDeviceSize size = static_cast<VkDeviceSize>(swapchainExtent.width) * swapchainExtent.height * 4;
+        CreateHostBuffer(size, VK_BUFFER_USAGE_TRANSFER_DST_BIT, captureBuffer_, captureMemory_, captureMapped_);
+    } else {
+        vkDeviceWaitIdle(device);
+        vkUnmapMemory(device, captureMemory_);
+        vkDestroyBuffer(device, captureBuffer_, nullptr);
+        vkFreeMemory(device, captureMemory_, nullptr);
+        captureBuffer_ = VK_NULL_HANDLE;
+        captureMemory_ = VK_NULL_HANDLE;
+        captureMapped_ = nullptr;
+    }
+    captureEnabled_ = enabled;
 }
 
 void VulkanContext::AddCircle(float cx, float cy, float radius, Color color) {
@@ -399,13 +418,42 @@ void VulkanContext::RenderFrame() {
     vkCmdEndRendering(cb);
     circles.clear();
 
-    VkImageMemoryBarrier toPresent{
-        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-        .srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, .dstAccessMask = 0,
-        .oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, .newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
-        .image = images[imageIndex], .subresourceRange = range,
-    };
-    vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 0, nullptr, 0, nullptr, 1, &toPresent);
+    if (captureEnabled_) {
+        // Copy the just-rendered image out to a host-visible staging buffer
+        // before presenting, so RenderFrame()'s caller can read raw BGRA8
+        // pixels back afterward (see EnableCapture/CapturedPixelData).
+        VkImageMemoryBarrier toTransferSrc{
+            .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+            .srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
+            .oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, .newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+            .image = images[imageIndex], .subresourceRange = range,
+        };
+        vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &toTransferSrc);
+
+        VkBufferImageCopy copyRegion{
+            .bufferOffset = 0, .bufferRowLength = 0, .bufferImageHeight = 0,
+            .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
+            .imageOffset = { 0, 0, 0 },
+            .imageExtent = { swapchainExtent.width, swapchainExtent.height, 1 },
+        };
+        vkCmdCopyImageToBuffer(cb, images[imageIndex], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, captureBuffer_, 1, &copyRegion);
+
+        VkImageMemoryBarrier toPresent{
+            .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+            .srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT, .dstAccessMask = 0,
+            .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, .newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+            .image = images[imageIndex], .subresourceRange = range,
+        };
+        vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 0, nullptr, 0, nullptr, 1, &toPresent);
+    } else {
+        VkImageMemoryBarrier toPresent{
+            .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+            .srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, .dstAccessMask = 0,
+            .oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, .newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+            .image = images[imageIndex], .subresourceRange = range,
+        };
+        vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 0, nullptr, 0, nullptr, 1, &toPresent);
+    }
 
     chk(vkEndCommandBuffer(cb));
 
@@ -417,10 +465,15 @@ void VulkanContext::RenderFrame() {
     VkResult presentResult = vkQueuePresentKHR(queue, &pi);
     if (presentResult == VK_ERROR_OUT_OF_DATE_KHR || presentResult == VK_SUBOPTIMAL_KHR) RecreateSwapchain();
     else if (presentResult != VK_SUCCESS) chk(presentResult);
+
+    // Block until this frame's copy-to-buffer has actually completed, so the
+    // caller can safely read CapturedPixelData() right after we return.
+    if (captureEnabled_) chk(vkWaitForFences(device, 1, &fence, VK_TRUE, UINT64_MAX));
 }
 
 void VulkanContext::Shutdown() {
     vkDeviceWaitIdle(device);
+    if (captureEnabled_) EnableCapture(false);
     ImGui_ImplVulkan_Shutdown();
     ImGui_ImplSDL3_Shutdown();
     ImGui::DestroyContext();
