@@ -86,9 +86,15 @@ bool VulkanContext::Init(SDL_Window* window) {
     vkGetPhysicalDeviceSurfaceFormatsKHR(physicalDevice, surface, &formatCount, nullptr);
     std::vector<VkSurfaceFormatKHR> formats(formatCount);
     vkGetPhysicalDeviceSurfaceFormatsKHR(physicalDevice, surface, &formatCount, formats.data());
+    // Prefer a UNORM swapchain format, not an _SRGB one: this app writes final display colors
+    // (clear color, ImGui theme, particle colors) directly as the intended 0..1 values, with no
+    // linear-space lighting anywhere that would want gamma-correct blending. An _SRGB image format
+    // makes the hardware treat every write as linear and re-encode it to sRGB on store, which
+    // brightens/washes out every color (e.g. clear color 0.17,0.20,0.27 (#2b3444) was rendering as
+    // a washed-out slate blue ~0.44,0.49,0.58) — UNORM stores exactly what's written.
     imageFormat = formats[0].format; colorSpace = formats[0].colorSpace;
     for (auto& f : formats)
-        if (f.format == VK_FORMAT_B8G8R8A8_SRGB && f.colorSpace == VK_COLORSPACE_SRGB_NONLINEAR_KHR)
+        if (f.format == VK_FORMAT_B8G8R8A8_UNORM && f.colorSpace == VK_COLORSPACE_SRGB_NONLINEAR_KHR)
             { imageFormat = f.format; colorSpace = f.colorSpace; break; }
 
     CreateSwapchain();
@@ -157,14 +163,110 @@ bool VulkanContext::Init(SDL_Window* window) {
     return true;
 }
 
+// Flat, softly-rounded theme — replaces ImGui's default sharp corners and saturated blue-on-gray
+// palette, which read as a debug overlay rather than an app UI. GUI panel color (#6f6a61) is kept
+// distinct from the sim canvas clear color (#2b3444, see RenderFrame) so the UI chrome reads as a
+// panel sitting on top of the canvas rather than one continuous surface.
+static void ApplyModernStyle() {
+    ImGuiStyle& style = ImGui::GetStyle();
+
+    style.WindowRounding    = 12.0f;
+    style.ChildRounding     = 10.0f;
+    style.FrameRounding     = 8.0f;
+    style.PopupRounding     = 10.0f;
+    style.ScrollbarRounding = 10.0f;
+    style.GrabRounding      = 8.0f;
+    style.TabRounding       = 8.0f;
+    style.WindowBorderSize  = 0.0f;
+    style.FrameBorderSize   = 0.0f;
+    style.PopupBorderSize   = 0.0f;
+    style.WindowPadding     = ImVec2(14.f, 14.f);
+    style.FramePadding      = ImVec2(10.f, 6.f);
+    style.ItemSpacing       = ImVec2(10.f, 8.f);
+    style.ItemInnerSpacing  = ImVec2(8.f, 6.f);
+    style.ScrollbarSize     = 14.f;
+    style.GrabMinSize       = 10.f;
+    style.ScaleAllSizes(1.2f); // a tad bigger overall — bigger windows, padding, controls, grips
+
+    const ImVec4 bg        (0.263f, 0.251f, 0.227f, 1.00f); // #43403a — darkened gui background
+    const ImVec4 bgAlt     (0.313f, 0.301f, 0.277f, 1.00f); // lighter panel/popup shade
+    const ImVec4 field     (0.353f, 0.341f, 0.317f, 1.00f); // input/button fill
+    const ImVec4 fieldHov  (0.413f, 0.401f, 0.377f, 1.00f);
+    const ImVec4 accent    (0.659f, 0.569f, 0.427f, 1.00f); // warm tan/taupe
+    const ImVec4 accentHov (0.749f, 0.663f, 0.518f, 1.00f);
+    const ImVec4 accentAct (0.545f, 0.463f, 0.333f, 1.00f);
+    const ImVec4 text      (0.737f, 0.702f, 0.647f, 1.00f); // #bcb3a5 — text
+    const ImVec4 textDim   (0.453f, 0.453f, 0.457f, 1.00f); // muted text, blended toward canvas bg
+    const ImVec4 headerBase(0.659f, 0.569f, 0.427f, 0.35f);
+    const ImVec4 headerHov (0.659f, 0.569f, 0.427f, 0.55f);
+    const ImVec4 headerAct (0.659f, 0.569f, 0.427f, 0.70f);
+
+    ImVec4* c = style.Colors;
+    c[ImGuiCol_Text]                 = text;
+    c[ImGuiCol_TextDisabled]         = textDim;
+    c[ImGuiCol_WindowBg]             = bg;
+    c[ImGuiCol_ChildBg]              = ImVec4(0.f, 0.f, 0.f, 0.f);
+    c[ImGuiCol_PopupBg]              = bgAlt;
+    c[ImGuiCol_Border]               = ImVec4(1.f, 1.f, 1.f, 0.06f);
+    c[ImGuiCol_FrameBg]              = field;
+    c[ImGuiCol_FrameBgHovered]       = fieldHov;
+    c[ImGuiCol_FrameBgActive]        = fieldHov;
+    c[ImGuiCol_TitleBg]              = bgAlt;
+    c[ImGuiCol_TitleBgActive]        = bgAlt;
+    c[ImGuiCol_TitleBgCollapsed]     = bgAlt;
+    c[ImGuiCol_MenuBarBg]            = bgAlt;
+    c[ImGuiCol_ScrollbarBg]          = ImVec4(0.f, 0.f, 0.f, 0.f);
+    c[ImGuiCol_ScrollbarGrab]        = field;
+    c[ImGuiCol_ScrollbarGrabHovered] = fieldHov;
+    c[ImGuiCol_ScrollbarGrabActive]  = accent;
+    c[ImGuiCol_CheckMark]            = accent;
+    c[ImGuiCol_SliderGrab]           = accent;
+    c[ImGuiCol_SliderGrabActive]     = accentHov;
+    c[ImGuiCol_Button]               = field;
+    c[ImGuiCol_ButtonHovered]        = fieldHov;
+    c[ImGuiCol_ButtonActive]         = accentAct;
+    c[ImGuiCol_Header]               = headerBase;
+    c[ImGuiCol_HeaderHovered]        = headerHov;
+    c[ImGuiCol_HeaderActive]         = headerAct;
+    c[ImGuiCol_Separator]            = ImVec4(1.f, 1.f, 1.f, 0.08f);
+    c[ImGuiCol_SeparatorHovered]     = accent;
+    c[ImGuiCol_SeparatorActive]      = accentHov;
+    c[ImGuiCol_ResizeGrip]           = ImVec4(1.f, 1.f, 1.f, 0.04f);
+    c[ImGuiCol_ResizeGripHovered]    = accent;
+    c[ImGuiCol_ResizeGripActive]     = accentHov;
+    c[ImGuiCol_Tab]                  = bgAlt;
+    c[ImGuiCol_TabHovered]           = fieldHov;
+    c[ImGuiCol_TabActive]            = field;
+    c[ImGuiCol_TabUnfocused]         = bgAlt;
+    c[ImGuiCol_TabUnfocusedActive]   = field;
+    c[ImGuiCol_PlotLines]            = accent;
+    c[ImGuiCol_PlotLinesHovered]     = accentHov;
+    c[ImGuiCol_PlotHistogram]        = accent;
+    c[ImGuiCol_PlotHistogramHovered] = accentHov;
+    c[ImGuiCol_TextSelectedBg]       = headerBase;
+    c[ImGuiCol_DragDropTarget]       = accent;
+    c[ImGuiCol_NavHighlight]         = accent;
+}
+
 void VulkanContext::InitImGui(SDL_Window* window) {
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
     ImGui::StyleColorsDark();
-    ImGuiStyle& style = ImGui::GetStyle();
-    style.WindowRounding    = 6.0f;
-    style.FrameRounding     = 4.0f;
-    style.WindowBorderSize  = 0.0f;
+    ApplyModernStyle();
+
+    // Default ImGui font is a small bitmap font (ProggyClean) — crisp at its one fixed size but
+    // blocky otherwise, which is most of what reads as "digital"/debug-overlay rather than app UI.
+    // Karla's soft, rounded terminals are the closest bundled match to a Pinterest-style rounded
+    // sans; it's fetched alongside imgui itself (misc/fonts) and copied next to the exe by
+    // CMakeLists' Fonts target, so it's always present without a separate asset download.
+    ImGuiIO& io = ImGui::GetIO();
+    const char* baseDir = SDL_GetBasePath();
+    std::string fontPath = std::string(baseDir ? baseDir : "") + "fonts/Karla-Regular.ttf";
+    ImFontConfig fontCfg;
+    fontCfg.OversampleH = 3;
+    fontCfg.OversampleV = 1;
+    if (!io.Fonts->AddFontFromFileTTF(fontPath.c_str(), 22.0f, &fontCfg))
+        io.Fonts->AddFontDefault();
 
     ImGui_ImplSDL3_InitForVulkan(window);
 
@@ -499,7 +601,7 @@ void VulkanContext::RenderFrame(float dt) {
         .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
         .imageView = imageViews[imageIndex], .imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
         .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR, .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
-        .clearValue = { .color = { .float32 = { 0.07f, 0.08f, 0.12f, 1.0f } } },
+        .clearValue = { .color = { .float32 = { 0.169f, 0.204f, 0.267f, 1.0f } } }, // #2b3444
     };
     VkRenderingInfo renderingInfo{
         .sType = VK_STRUCTURE_TYPE_RENDERING_INFO,

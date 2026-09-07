@@ -13,6 +13,8 @@ struct Object {
     float pressure = 0.f;
 
     float Radius() const;
-    void  Draw(App& app) const;
+    // colorOverride, when non-null, is drawn instead of renderable.color — used to recolor
+    // particles by a live field (speed/pressure/density) without touching the scene's own color.
+    void  Draw(App& app, const Color* colorOverride = nullptr) const;
 };
 

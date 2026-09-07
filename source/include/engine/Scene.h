@@ -1,5 +1,6 @@
 #pragma once
 #include "Config.h"
+#include "util/Vector.h"
 #include <vector>
 
 // Simulation container half-extents, as a fraction of the window's half-extents (1.0 = walls at
@@ -7,10 +8,18 @@
 struct SceneBoundary {
     float widthFrac  = 1.0f;
     float heightFrac = 1.0f;
+    // If set, the left/right walls don't bounce particles — a particle crossing one teleports to
+    // the other side instead (position only; velocity untouched), simulating an infinite domain
+    // for a channel-flow test. main.cpp mirrors real particles across the seam too (see
+    // ForEachPeriodicX) so density/pressure near the seam are computed as if particles from the
+    // opposite edge really are nearby, matching what an infinite domain would give.
+    bool  periodicX  = false;
 };
 
 struct ScenePhysics {
-    float gravity       = 600.0f; // pixels/s^2
+    // Constant acceleration applied to every particle every frame (pixels/s^2) — gravity is just
+    // the common case of this pointing down; a horizontal force drives channel-flow tests instead.
+    Vec2  force          = Vec2(0.f, -600.f);
     float restitution   = 0.85f;
     // Fraction of tangential velocity removed on wall contact when noSlipWalls is enabled.
     float friction       = 0.3f;

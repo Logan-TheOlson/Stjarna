@@ -5,6 +5,7 @@
 #include "Config.h"
 #include <imgui.h>
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <filesystem>
 #include <fstream>
@@ -49,6 +50,37 @@ static void WriteKineticEnergyCsv(const std::vector<KESample>& keByFrame) {
         out << s.run << ',' << s.frame << ',' << s.ke << '\n';
 }
 
+// Bins particles by y-position across the current scene's channel height and writes each bin's
+// average x-velocity to a CSV next to the executable — e.g. the parabolic profile a Poiseuille
+// scene should develop. Overwritten every time this is called (see the main loop's call site),
+// so the file always reflects a recent snapshot rather than one moment early in the transient.
+static void WriteVelocityProfileCsv() {
+    constexpr int kBins = 40;
+    const float hh = ScreenHalfHeight();
+    if (hh <= 0.f || objects.empty()) return;
+
+    std::array<double, kBins> sumVx{};
+    std::array<int, kBins>    count{};
+    for (auto& obj : objects) {
+        const float t   = (obj.pos.y + hh) / (2.f * hh); // 0..1 across the channel
+        const int   bin = std::clamp(static_cast<int>(t * kBins), 0, kBins - 1);
+        sumVx[bin] += obj.vel.x;
+        count[bin]++;
+    }
+
+    const auto outPath = ExecutableDir() / "velocity_profile.csv";
+    std::ofstream out(outPath);
+    if (!out) return;
+
+    out << "y,avg_vx,count\n";
+    const float binHeight = 2.f * hh / kBins;
+    for (int b = 0; b < kBins; b++) {
+        if (count[b] == 0) continue;
+        const float yCenter = -hh + (b + 0.5f) * binHeight;
+        out << yCenter << ',' << (sumVx[b] / count[b]) << ',' << count[b] << '\n';
+    }
+}
+
 static App      app;
 static Profiler profiler;
 static bool     profilerOpen = false;
@@ -69,6 +101,36 @@ static MenuConfig menuConfig;
 
 // Identifies which Start-Simulation/Restart session a KESample belongs to (see WriteKineticEnergyCsv).
 static int runIndex = -1;
+
+// Live coloring: recolors every particle by a current simulation field instead of its scene
+// color, so a fast flow (e.g. Poiseuille) is readable even when it's moving too fast to track
+// individual particles. Each field gets its own low/high color pair, independently editable, so
+// switching modes is visually obvious rather than "the same gradient, different numbers".
+enum class ColorMode { Off, Speed, Pressure, Density };
+static const char* ColorModeNames[] = { "Off (scene color)", "Speed", "Pressure", "Density" };
+
+struct ColorRamp { Color low; Color high; };
+static ColorMode colorMode = ColorMode::Off;
+// Indexed by ColorMode; entry 0 (Off) is unused.
+static ColorRamp colorRamps[] = {
+    {},
+    { {0.15f, 0.25f, 0.95f, 1.f}, {0.95f, 0.15f, 0.10f, 1.f} }, // Speed:    blue   -> red
+    { {0.05f, 0.55f, 0.15f, 1.f}, {1.00f, 0.90f, 0.10f, 1.f} }, // Pressure: green  -> yellow
+    { {0.55f, 0.05f, 0.65f, 1.f}, {1.00f, 0.55f, 0.05f, 1.f} }, // Density:  purple -> orange
+};
+
+static float FieldValue(const Object& o, ColorMode mode) {
+    switch (mode) {
+        case ColorMode::Speed:    return magnitude(o.vel);
+        case ColorMode::Pressure: return o.pressure;
+        case ColorMode::Density:  return o.density;
+        default:                  return 0.f;
+    }
+}
+
+static Color LerpColor(const Color& a, const Color& b, float t) {
+    return { a.r + (b.r - a.r) * t, a.g + (b.g - a.g) * t, a.b + (b.b - a.b) * t, 1.f };
+}
 
 static void ResetSimulation() {
     objects.clear();
@@ -105,8 +167,10 @@ static void DrawMenu() {
     ImGui::TextUnformatted("SPH Fluid Simulation");
     ImGui::Separator();
 
+    ImGui::TextUnformatted("Scene");
+    ImGui::SetNextItemWidth(-FLT_MIN);
     const Scene& selectedScene = ScenePresets[menuConfig.sceneIndex];
-    if (ImGui::BeginCombo("Scene", selectedScene.name)) {
+    if (ImGui::BeginCombo("##scene", selectedScene.name)) {
         for (int i = 0; i < static_cast<int>(ScenePresets.size()); i++) {
             const bool isSelected = (i == menuConfig.sceneIndex);
             if (ImGui::Selectable(ScenePresets[i].name, isSelected))
@@ -138,19 +202,55 @@ static void DrawMenu() {
 static void DrawRunningOverlay() {
     const ImGuiIO& io = ImGui::GetIO();
     ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x - 10.f, 10.f), ImGuiCond_Always, ImVec2(1.f, 0.f));
-    ImGui::SetNextWindowBgAlpha(0.75f);
+    ImGui::SetNextWindowBgAlpha(0.85f);
     ImGui::Begin("Controls", nullptr,
         ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize |
         ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoNav);
 
-    ImGui::TextDisabled("%s", ActiveScene.name);
+    // Fixed content width (rather than whatever the widest row happens to auto-size to) so the
+    // panel doesn't visibly resize when the color-by rows appear/disappear, and so the row-content
+    // computations below (button/combo/swatch alignment) have a stable width to work from.
+    constexpr float ContentWidth = 240.f;
+    const float     swatchSize   = ImGui::GetFrameHeight();
 
-    if (app.IsRecording())
+    ImGui::TextUnformatted(ActiveScene.name);
+    if (app.IsRecording()) {
+        ImGui::SameLine();
         ImGui::TextColored(ImVec4(1.0f, 0.3f, 0.3f, 1.0f), "REC %.1fs", app.RecordedSeconds());
+    }
 
-    if (ImGui::Button("Restart")) RestartSimulation();
+    ImGui::Spacing();
+    const float buttonWidth = (ContentWidth - ImGui::GetStyle().ItemSpacing.x) * 0.5f;
+    if (ImGui::Button("Restart", ImVec2(buttonWidth, 0.f))) RestartSimulation();
     ImGui::SameLine();
-    if (ImGui::Button("Menu")) ReturnToMenu();
+    if (ImGui::Button("Menu", ImVec2(buttonWidth, 0.f))) ReturnToMenu();
+
+    ImGui::Spacing();
+    ImGui::Separator();
+    ImGui::Spacing();
+
+    ImGui::TextUnformatted("Color by");
+    ImGui::SetNextItemWidth(ContentWidth);
+    int modeIdx = static_cast<int>(colorMode);
+    if (ImGui::Combo("##colorby", &modeIdx, ColorModeNames, IM_ARRAYSIZE(ColorModeNames)))
+        colorMode = static_cast<ColorMode>(modeIdx);
+
+    if (colorMode != ColorMode::Off) {
+        ColorRamp& ramp = colorRamps[modeIdx];
+        ImGui::Spacing();
+
+        // Label on the left, swatch pinned to the content's right edge — NoInputs leaves just the
+        // swatch button here, all sliders live in the popup it opens.
+        ImGui::AlignTextToFramePadding();
+        ImGui::TextUnformatted("Low");
+        ImGui::SameLine(ContentWidth - swatchSize);
+        ImGui::ColorEdit3("##low", &ramp.low.r, ImGuiColorEditFlags_NoInputs);
+
+        ImGui::AlignTextToFramePadding();
+        ImGui::TextUnformatted("High");
+        ImGui::SameLine(ContentWidth - swatchSize);
+        ImGui::ColorEdit3("##high", &ramp.high.r, ImGuiColorEditFlags_NoInputs);
+    }
 
     ImGui::End();
 }
@@ -178,8 +278,19 @@ float ScreenHalfHeight() { return app.HalfHeight() * ActiveScene.boundary.height
 static void DrawBoundary(App& app) {
     constexpr float BorderThickness = 6.0f;
     constexpr Color BorderColor     = { 0.f, 0.f, 0.f, 1.f };
-    app.AddRectOutline(0.f, 0.f, ScreenHalfWidth() + BorderThickness, ScreenHalfHeight() + BorderThickness,
-                        BorderThickness, BorderColor);
+    const float hw = ScreenHalfWidth(), hh = ScreenHalfHeight();
+
+    if (ActiveScene.boundary.periodicX) {
+        // No side walls to draw when X wraps — just solid top/bottom bars marking the channel's
+        // Y confinement. A border thickness bigger than the bar itself fills it solid rather than
+        // drawing it as a hollow frame (see AddRectOutline).
+        constexpr float FillSolid = 1e6f;
+        const float barHalfHeight = BorderThickness * 0.5f;
+        app.AddRectOutline(0.f,  hh + barHalfHeight, hw + BorderThickness, barHalfHeight, FillSolid, BorderColor);
+        app.AddRectOutline(0.f, -hh - barHalfHeight, hw + BorderThickness, barHalfHeight, FillSolid, BorderColor);
+    } else {
+        app.AddRectOutline(0.f, 0.f, hw + BorderThickness, hh + BorderThickness, BorderThickness, BorderColor);
+    }
 }
 
 // vt is the velocity component tangential to this axis's wall (e.g. vel.y when resolving the
@@ -199,11 +310,19 @@ static void resolveAxis(float& p, float& v, float& vt, float half, float r) {
 // (see the main loop), not here.
 static void Integrate(float subDt) {
     const float hw = ScreenHalfWidth(), hh = ScreenHalfHeight();
+    const bool  periodicX = ActiveScene.boundary.periodicX;
     for (auto& obj : objects) {
         const float r = obj.Radius();
         obj.vel += obj.acc * subDt;
         obj.pos += obj.vel * subDt;
-        resolveAxis(obj.pos.x, obj.vel.x, obj.vel.y, hw, r);
+        if (periodicX) {
+            // Teleport across the seam rather than bounce — velocity is left untouched, so the
+            // channel behaves like an infinite domain rather than a wall.
+            if      (obj.pos.x >  hw) obj.pos.x -= 2.f * hw;
+            else if (obj.pos.x < -hw) obj.pos.x += 2.f * hw;
+        } else {
+            resolveAxis(obj.pos.x, obj.vel.x, obj.vel.y, hw, r);
+        }
         resolveAxis(obj.pos.y, obj.vel.y, obj.vel.x, hh, r);
     }
 }
@@ -251,25 +370,53 @@ int main(int, char**) {
         }
         profiler.MarkComputeEnd();
 
-        for (auto& obj : objects)
-            obj.Draw(app);
+        // Single scan for both the running kinetic energy (always needed) and, when a color-by
+        // mode is active, that field's frame range — folded together rather than a dedicated pass
+        // just for the min/max, since both need every particle visited once before drawing anyway.
+        const bool coloring = colorMode != ColorMode::Off && !objects.empty();
+        float kineticEnergy = 0.f;
+        float colorLo = 0.f, colorHi = 0.f;
+        if (coloring) colorLo = colorHi = FieldValue(objects[0], colorMode);
+        for (auto& obj : objects) {
+            kineticEnergy += 0.5f * (obj.vel.x * obj.vel.x + obj.vel.y * obj.vel.y);
+            if (coloring) {
+                const float v = FieldValue(obj, colorMode);
+                colorLo = std::min(colorLo, v);
+                colorHi = std::max(colorHi, v);
+            }
+        }
+
+        if (coloring) {
+            // Auto-scaled to the current frame's range rather than a fixed scale — the field's
+            // magnitude varies wildly across scenes (and over a Poiseuille run's own ramp-up), so a
+            // fixed range would either clip everything to one end or wash out early on.
+            const ColorRamp& ramp = colorRamps[static_cast<int>(colorMode)];
+            const float range = colorHi - colorLo;
+            for (auto& obj : objects) {
+                float t = range > 0.f ? (FieldValue(obj, colorMode) - colorLo) / range : 0.f;
+                Color c = LerpColor(ramp.low, ramp.high, t);
+                obj.Draw(app, &c);
+            }
+        } else {
+            for (auto& obj : objects)
+                obj.Draw(app);
+        }
         if (appState == AppState::Running) DrawBoundary(app);
 
         app.RenderFrame(dt);
         profiler.MarkRenderEnd();
         app.SetObjectCount(static_cast<int>(objects.size()));
 
-        float kineticEnergy = 0.f;
-        for (auto& obj : objects)
-            kineticEnergy += 0.5f * (obj.vel.x * obj.vel.x + obj.vel.y * obj.vel.y);
         app.SetKineticEnergy(kineticEnergy);
         if (appState == AppState::Running) {
             if (runIndex != lastRunIndex) { lastRunIndex = runIndex; runFrame = 0; }
             keByFrame.push_back({ runIndex, runFrame++, kineticEnergy });
         }
 
-        if (profiler.Tick())
+        if (profiler.Tick()) {
             app.SetProfilerStats(profiler.GetStats());
+            if (appState == AppState::Running) WriteVelocityProfileCsv();
+        }
 
         profiler.MarkFrameStart();
     }

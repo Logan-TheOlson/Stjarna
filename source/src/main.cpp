@@ -137,8 +137,11 @@ static WallMirror NearestWall(float coord, float half) {
 // Radius of `pos`. No-op away from all walls.
 template <typename Fn>
 static void ForEachGhost(const Vec2& pos, Fn&& fn) {
-    const WallMirror wx = NearestWall(pos.x, ScreenHalfWidth());
+    // No X wall to mirror across when the domain wraps — ForEachPeriodicX below handles that axis.
+    const WallMirror wx = ActiveScene.boundary.periodicX ? WallMirror{} : NearestWall(pos.x, ScreenHalfWidth());
     const WallMirror wy = NearestWall(pos.y, ScreenHalfHeight());
+
+    const bool noSlip = ActiveScene.physics.noSlipWalls;
 
     auto pass = [&](bool mirrorX, bool mirrorY) {
         Vec2 query = pos;
@@ -146,9 +149,23 @@ static void ForEachGhost(const Vec2& pos, Fn&& fn) {
         if (mirrorY) query.y = 2.f * wy.wall - pos.y;
 
         ForEachNeighbor(query, [&](int32_t j) {
-            Vec2 gp = hotPos[j], gv = hotVel[j];
-            if (mirrorX) { gp.x = 2.f * wx.wall - hotPos[j].x; gv.x = -hotVel[j].x; }
-            if (mirrorY) { gp.y = 2.f * wy.wall - hotPos[j].y; gv.y = -hotVel[j].y; }
+            Vec2 gp = hotPos[j];
+            if (mirrorX) gp.x = 2.f * wx.wall - hotPos[j].x;
+            if (mirrorY) gp.y = 2.f * wy.wall - hotPos[j].y;
+
+            // Free-slip: only the wall-normal velocity component reverses (impermeable, but no
+            // drag on the tangential flow). No-slip: the whole velocity reverses, so the SPH
+            // viscosity force between a real particle and its ghost averages their velocities
+            // toward zero right at the wall in every direction — that's what actually produces
+            // the wall drag a Poiseuille profile depends on; the friction hack in resolveAxis
+            // alone only fires on an actual wall collision, which barely happens once flow settles.
+            Vec2 gv = hotVel[j];
+            if (noSlip) {
+                gv = gv * -1.f;
+            } else {
+                if (mirrorX) gv.x = -hotVel[j].x;
+                if (mirrorY) gv.y = -hotVel[j].y;
+            }
             fn(Ghost{ gp, gv, j });
         });
     };
@@ -156,6 +173,52 @@ static void ForEachGhost(const Vec2& pos, Fn&& fn) {
     if (wx.active)               pass(true,  false);
     if (wy.active)               pass(false, true);
     if (wx.active && wy.active)  pass(true,  true);
+}
+
+// Periodic-image particles for a wrapped X boundary (see SceneBoundary::periodicX): a particle
+// near the right edge needs the real particles just past the left edge as neighbors (and vice
+// versa) for its density/pressure to come out as if the domain just continued — exactly what an
+// infinite channel would give. Unlike ForEachGhost's wall mirror, this is a translation (by the
+// domain width), not a reflection, and it carries real particles' velocities through unchanged.
+template <typename Fn>
+static void ForEachPeriodicX(const Vec2& pos, Fn&& fn) {
+    if (!ActiveScene.boundary.periodicX) return;
+    const float hw          = ScreenHalfWidth();
+    const float domainWidth = 2.f * hw;
+    // A particle near one of the channel's four corners (both a Y wall and the periodic seam)
+    // needs the shifted-AND-mirrored diagonal image too — ForEachGhost never produces it since
+    // periodicX forces its own X-mirror off, leaving that corner case to be handled here instead.
+    const WallMirror wy = NearestWall(pos.y, ScreenHalfHeight());
+    const bool noSlip   = ActiveScene.physics.noSlipWalls;
+
+    auto pass = [&](float shift) {
+        Vec2 query = pos;
+        query.x -= shift;
+        ForEachNeighbor(query, [&](int32_t j) {
+            Vec2 gp = hotPos[j];
+            gp.x += shift;
+            fn(Ghost{ gp, hotVel[j], j });
+        });
+
+        if (wy.active) {
+            Vec2 cornerQuery = query;
+            cornerQuery.y = 2.f * wy.wall - pos.y;
+            ForEachNeighbor(cornerQuery, [&](int32_t j) {
+                Vec2 gp = hotPos[j];
+                gp.x += shift;
+                gp.y = 2.f * wy.wall - hotPos[j].y;
+                // Same free-slip/no-slip rule as ForEachGhost's own Y-mirror case (see its
+                // comment) — the periodic X shift never touches velocity either way.
+                Vec2 gv = hotVel[j];
+                if (noSlip) gv = gv * -1.f;
+                else        gv.y = -hotVel[j].y;
+                fn(Ghost{ gp, gv, j });
+            });
+        }
+    };
+
+    if (pos.x + hw < Radius) pass(-domainWidth);  // near the left edge: pull in images from the right
+    if (hw - pos.x < Radius) pass(domainWidth);   // near the right edge: pull in images from the left
 }
 
 // ----------- Kernels
@@ -240,6 +303,7 @@ static void CalculateDensity (int32_t k) // Calculates local density at a partic
 
     ForEachNeighbor(pos, [&](int32_t j) { accumulate(hotPos[j]); });
     ForEachGhost(pos, [&](const Ghost& g) { accumulate(g.pos); }); // no self-exclusion, see Ghost comment
+    ForEachPeriodicX(pos, [&](const Ghost& g) { accumulate(g.pos); }); // ditto — real neighbors, not self
 
     hotDensity[k] = density;
 }
@@ -289,6 +353,9 @@ static void CalculatePressureForce (int32_t k)
 
     // No self-exclusion: a particle right at the wall does feel a force from its own mirror image
     ForEachGhost(pos, [&](const Ghost& g) {
+        accumulate(g.pos, g.vel, hotDensity[g.src], hotPressure[g.src]);
+    });
+    ForEachPeriodicX(pos, [&](const Ghost& g) {
         accumulate(g.pos, g.vel, hotDensity[g.src], hotPressure[g.src]);
     });
 
@@ -343,12 +410,12 @@ void Update(float) {
     });
 
     // Scatter hot results back onto the real objects.
-    const float gravity = ActiveScene.physics.gravity;
+    const Vec2 force = ActiveScene.physics.force;
     for (int32_t k = 0; k < n; k++) {
         Object& o = objects[hotToReal[k]];
         o.density   = hotDensity[k];
         o.pressure  = hotPressure[k];
         o.acc      += hotForce[k];
-        o.acc.y    -= gravity;
+        o.acc      += force;
     }
 }

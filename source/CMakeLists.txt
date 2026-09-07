@@ -54,6 +54,19 @@ add_custom_target(Shaders DEPENDS
     ${SHADER_OUT}/rect.vert.spv ${SHADER_OUT}/rect.frag.spv
 )
 
+# Karla ships with the fetched imgui source (misc/fonts) — copy it next to the exe so
+# VulkanContext::InitImGui can load a real sans-serif font instead of ImGui's default bitmap font.
+# Karla's soft, rounded letterforms are the closest bundled match to a Pinterest-style rounded sans.
+set(FONT_OUT ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/fonts)
+add_custom_command(
+    OUTPUT  ${FONT_OUT}/Karla-Regular.ttf
+    COMMAND ${CMAKE_COMMAND} -E make_directory ${FONT_OUT}
+    COMMAND ${CMAKE_COMMAND} -E copy ${imgui_SOURCE_DIR}/misc/fonts/Karla-Regular.ttf ${FONT_OUT}/Karla-Regular.ttf
+    DEPENDS ${imgui_SOURCE_DIR}/misc/fonts/Karla-Regular.ttf
+    VERBATIM
+)
+add_custom_target(Fonts DEPENDS ${FONT_OUT}/Karla-Regular.ttf)
+
 if (WIN32)
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -DVK_USE_PLATFORM_WIN32_KHR")
 elseif (LINUX)
@@ -111,4 +124,4 @@ endif()
 set_target_properties(${NAME} PROPERTIES DEBUGGER_WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
 target_compile_features(${NAME} PRIVATE cxx_std_20)
 target_link_libraries(${NAME} PRIVATE ${SDL_LIBRARY} imgui_lib volk)
-add_dependencies(${NAME} Shaders)
+add_dependencies(${NAME} Shaders Fonts)

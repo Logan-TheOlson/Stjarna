@@ -6,61 +6,46 @@ void RecomputeSphConstants();
 
 namespace {
     Scene MakeOpenTank() {
-        return Scene{
+        Scene s{
             .name = "Open Tank",
             .description = "Full-window box; a centered block of fluid falls and settles.",
         };
-    }
-
-    Scene MakeDamBreak() {
-        Scene s = MakeOpenTank();
-        s.name        = "Dam Break";
-        s.description = "A column of fluid held near the left wall, released into an empty tank.";
-        s.spawn.gridCountX  = 50;
-        s.spawn.offsetXFrac = -0.6f;
+        // ForEachGhost's no-slip ghosts (full velocity reversal, not just the wall-normal
+        // component) were added for Poiseuille's wall drag and are much stronger than the old
+        // occasional friction-on-contact — this scene predates and wasn't tuned against that
+        // effect, so opt back into the original free-slip walls explicitly rather than silently
+        // inheriting ScenePhysics::noSlipWalls' default.
+        s.physics.noSlipWalls = false;
         return s;
     }
 
-    Scene MakeDroplet() {
+    // Classic force-driven planar Poiseuille flow: no gravity, just a uniform horizontal force
+    // pushing fluid left-to-right through a narrow no-slip channel (solid top/bottom walls). The
+    // left/right boundary is periodic — a particle exiting the right edge reappears at the left,
+    // and main.cpp's ForEachPeriodicX mirrors real particles across that seam for density/pressure
+    // too — so the channel behaves as if it were infinitely long, the standard setup for this
+    // test. Viscous drag against the walls (vs. the free interior) should develop into the classic
+    // parabolic velocity profile: fastest at the channel's center, near-zero at the walls.
+    Scene MakePoiseuille() {
         Scene s = MakeOpenTank();
-        s.name        = "Droplet";
-        s.description = "A circular blob of fluid dropped into the middle of an empty tank.";
-        s.spawn.gridCountX = s.spawn.gridCountY = 126; // ~pi/4 fill factor keeps particle count near the other presets'
-        s.spawn.circular    = true;
-        return s;
-    }
-
-    Scene MakeNarrowTank() {
-        Scene s = MakeOpenTank();
-        s.name        = "Narrow Tank";
-        s.description = "Half-width container — same fluid, walls close enough to matter.";
-        s.boundary.widthFrac = 0.4f;
-        return s;
-    }
-
-    Scene MakeSyrup() {
-        Scene s = MakeOpenTank();
-        s.name        = "Syrup";
-        s.description = "Low gravity, heavy viscosity — slow, sluggish flow.";
-        s.physics.gravity            = 250.f;
-        s.particles.viscosity          = 2.5f;
-        s.particles.viscosityQuadratic = 0.2f;
-        s.particles.circleColor        = { 0.85f, 0.55f, 0.15f, 1.0f };
-        return s;
-    }
-
-    Scene MakeZeroG() {
-        Scene s = MakeOpenTank();
-        s.name        = "Zero Gravity";
-        s.description = "No gravity — fluid just jostles around under its own pressure.";
-        s.physics.gravity     = 0.f;
-        s.particles.circleColor = { 0.7f, 0.3f, 0.9f, 1.0f };
+        s.name        = "Poiseuille Flow";
+        s.description = "Periodic horizontal channel; a uniform force (no gravity) drives fluid "
+                         "left-to-right, developing the classic parabolic velocity profile against "
+                         "the no-slip walls.";
+        s.boundary.heightFrac = 0.2f;
+        s.boundary.periodicX  = true;
+        s.spawn.gridCountX    = 280;
+        s.spawn.gridCountY    = 22;
+        s.physics.force         = Vec2(300.f, 0.f);
+        s.physics.noSlipWalls   = true; // the wall drag this whole scene exists to demonstrate
+        s.particles.viscosity   = 1.0f;
+        s.particles.circleColor = { 0.2f, 0.9f, 0.8f, 1.0f };
         return s;
     }
 }
 
 const std::vector<Scene> ScenePresets = {
-    MakeOpenTank(), MakeDamBreak(), MakeDroplet(), MakeNarrowTank(), MakeSyrup(), MakeZeroG(),
+    MakeOpenTank(), MakePoiseuille(),
 };
 
 Scene ActiveScene = ScenePresets[0];
