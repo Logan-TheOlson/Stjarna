@@ -36,9 +36,13 @@ namespace {
         s.boundary.periodicX  = true;
         s.spawn.gridCountX    = 280;
         s.spawn.gridCountY    = 22;
-        s.physics.force         = Vec2(300.f, 0.f);
+        // Tuned so the plug settles into equilibrium quickly and at a speed still slow enough to
+        // watch: higher viscosity damps the initial transient faster (and pulls the eventual
+        // plug speed down on its own), lower force pulls the terminal speed down further on top
+        // of that — both push the same direction, so they compound rather than fight each other.
+        s.physics.force         = Vec2(100.f, 0.f);
         s.physics.noSlipWalls   = true; // the wall drag this whole scene exists to demonstrate
-        s.particles.viscosity   = 1.0f;
+        s.particles.viscosity   = 4.0f;
         s.particles.circleColor = { 0.2f, 0.9f, 0.8f, 1.0f };
         return s;
     }

@@ -1,14 +1,17 @@
 ﻿#include "engine/Engine.h"
 #include "engine/Scene.h"
 #include "renderer/App.h"
+#include "util/DataRecorder.h"
 #include "util/Profiler.h"
 #include "Config.h"
 #include <imgui.h>
 #include <algorithm>
 #include <array>
+#include <cctype>
 #include <chrono>
 #include <filesystem>
 #include <fstream>
+#include <string>
 
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
@@ -90,14 +93,51 @@ static bool     profilerOpen = false;
 enum class AppState { Menu, Running };
 static AppState appState = AppState::Menu;
 
+// Freezes physics (rendering, recording, and CSV data-saving all keep running) — toggled by
+// Space or the Pause/Resume button. Independent of appState so a paused sim stays paused across
+// UI redraws; only Restart/Menu/StartSimulation touch it.
+static bool paused = false;
+
+constexpr float StepDt         = 1.f / 60.f; // fixed nominal frame length for manual stepping, so a
+                                              // step is deterministic regardless of real elapsed time
+constexpr int   BigStepFrames  = 10;         // frames advanced by Left Arrow / the "Step x10" button
+
 struct MenuConfig {
     bool  record = false;
     char  title[128] = "capture";
     int   fps = 60;
     float lengthSeconds = 10.f;
     int   sceneIndex = 0;
+
+    bool  saveData = false;
+    char  dataTitle[128] = "data";
+    int   dataRate = 30; // samples/sec, independent of render fps — see the "Save data to CSV" section
+    float dataLengthSeconds = 10.f;
+    bool  dataPosition = true;
+    bool  dataVelocity = true;
+    bool  dataSpeed = false;
+    bool  dataDensity = true;
+    bool  dataPressure = true;
 };
 static MenuConfig menuConfig;
+
+// Owned directly by Engine.cpp (unlike Recorder, which lives behind App/VulkanContext because it
+// needs the composited GPU frame) since the data it samples — `objects` — already lives here.
+static DataRecorder dataRecorder;
+static float        dataAccum{ 0.f };        // seconds since the last sample, gated at menuConfig.dataRate like Recorder's fps gate
+static float        dataElapsed{ 0.f };       // sim seconds since this data save started, for the CSV's time column
+static uint32_t     dataSavedFrames{ 0 };
+static int          dataRateActive{ 0 };
+static float        dataLengthActive{ 0.f };  // 0 = unlimited, mirrors menuConfig.lengthSeconds for video
+
+// Strips anything unsafe as a filename (mirrors App::StartRecording's title sanitizing).
+static std::string SanitizeFilename(const char* raw, const char* fallback) {
+    std::string safe;
+    for (const char* c = raw; *c; c++)
+        safe += (std::isalnum((unsigned char)*c) || *c == '-' || *c == '_' || *c == ' ') ? *c : '_';
+    if (safe.empty()) safe = fallback;
+    return safe;
+}
 
 // Identifies which Start-Simulation/Restart session a KESample belongs to (see WriteKineticEnergyCsv).
 static int runIndex = -1;
@@ -132,28 +172,79 @@ static Color LerpColor(const Color& a, const Color& b, float t) {
     return { a.r + (b.r - a.r) * t, a.g + (b.g - a.g) * t, a.b + (b.b - a.b) * t, 1.f };
 }
 
+// Defined further down (needs ScreenHalfWidth/Height); forward-declared so AdvanceSimulation can
+// call it despite living earlier in the file, next to the other pause/step/menu logic.
+static void Integrate(float subDt);
+
 static void ResetSimulation() {
     objects.clear();
     Init();
     runIndex++;
+    paused = false;
 }
+
+// Advances one substep loop's worth of physics by dt — factored out of the main loop so manual
+// stepping (paused, one keypress/button = one frame) runs the exact same code path as normal
+// per-frame advancement, just with a fixed dt instead of the frame's real one.
+static void AdvanceSimulation(float dt) {
+    const auto& physics = ActiveScene.physics;
+    // Force is recomputed every forceInterval substeps (not once per frame, not every substep) —
+    // see Integrate()'s comment for why a stale force is a real energy-gain source, and why
+    // recomputing every substep was too expensive at this particle count.
+    const float subDt = dt / static_cast<float>(physics.substeps);
+    for (int step = 0; step < physics.substeps; step++) {
+        if (step % physics.forceInterval == 0) {
+            for (auto& obj : objects) obj.acc = Vec2(0.0f, 0.0f);
+            Update(subDt);
+        }
+        Integrate(subDt);
+    }
+}
+
+static void TogglePause() { paused = !paused; }
+
+// Stepping always pauses first (if not already) — pressing Step/the arrow keys while running
+// freezes the sim on that frame rather than requiring a separate pause press first.
+static void StepOnce() { paused = true; AdvanceSimulation(StepDt); }
+static void StepBig()  { paused = true; for (int i = 0; i < BigStepFrames; i++) AdvanceSimulation(StepDt); }
 
 static void StartSimulationFromMenu() {
     LoadScene(ScenePresets[menuConfig.sceneIndex]);
     ResetSimulation();
     if (menuConfig.record)
         app.StartRecording(menuConfig.title, menuConfig.fps, menuConfig.lengthSeconds);
+    if (menuConfig.saveData) {
+        DataRecorder::Fields fields;
+        fields.position = menuConfig.dataPosition;
+        fields.velocity = menuConfig.dataVelocity;
+        fields.speed    = menuConfig.dataSpeed;
+        fields.density  = menuConfig.dataDensity;
+        fields.pressure = menuConfig.dataPressure;
+
+        const auto  dir = ExecutableDir() / "data";
+        std::error_code ec;
+        std::filesystem::create_directories(dir, ec);
+        const std::string safeTitle = SanitizeFilename(menuConfig.dataTitle, "data");
+        if (!ec && dataRecorder.Start((dir / (safeTitle + ".csv")).string(), fields)) {
+            dataRateActive   = std::clamp(menuConfig.dataRate, 1, 240);
+            dataLengthActive = menuConfig.dataLengthSeconds;
+            dataAccum        = 0.f;
+            dataElapsed      = 0.f;
+            dataSavedFrames  = 0;
+        }
+    }
     appState = AppState::Running;
 }
 
-// Resets the sim in place without leaving Running (and without touching any active recording) —
-// distinct from ReturnToMenu, which is the "stop and reconfigure" path.
+// Resets the sim in place without leaving Running (and without touching any active recording or
+// data save) — distinct from ReturnToMenu, which is the "stop and reconfigure" path.
 static void RestartSimulation() {
     ResetSimulation();
 }
 
 static void ReturnToMenu() {
     app.StopRecording();
+    dataRecorder.Stop();
     objects.clear();
     appState = AppState::Menu;
 }
@@ -193,6 +284,28 @@ static void DrawMenu() {
     }
 
     ImGui::Separator();
+    ImGui::Checkbox("Save data to CSV", &menuConfig.saveData);
+    if (menuConfig.saveData) {
+        ImGui::InputText("Data title", menuConfig.dataTitle, sizeof(menuConfig.dataTitle));
+        ImGui::InputInt("Sample rate (Hz)", &menuConfig.dataRate);
+        menuConfig.dataRate = std::clamp(menuConfig.dataRate, 1, 240);
+        ImGui::InputFloat("Save length (s, 0 = unlimited)", &menuConfig.dataLengthSeconds, 1.0f, 10.0f, "%.0f");
+        menuConfig.dataLengthSeconds = std::max(menuConfig.dataLengthSeconds, 0.f);
+
+        ImGui::TextUnformatted("Fields");
+        ImGui::Checkbox("Position", &menuConfig.dataPosition);
+        ImGui::SameLine();
+        ImGui::Checkbox("Velocity", &menuConfig.dataVelocity);
+        ImGui::SameLine();
+        ImGui::Checkbox("Speed", &menuConfig.dataSpeed);
+        ImGui::Checkbox("Density", &menuConfig.dataDensity);
+        ImGui::SameLine();
+        ImGui::Checkbox("Pressure", &menuConfig.dataPressure);
+
+        ImGui::TextDisabled("Saved to data/<title>.csv (one row per particle per sample)");
+    }
+
+    ImGui::Separator();
     if (ImGui::Button("Start Simulation", ImVec2(260.f, 0.f)))
         StartSimulationFromMenu();
 
@@ -218,12 +331,28 @@ static void DrawRunningOverlay() {
         ImGui::SameLine();
         ImGui::TextColored(ImVec4(1.0f, 0.3f, 0.3f, 1.0f), "REC %.1fs", app.RecordedSeconds());
     }
+    if (dataRecorder.IsActive()) {
+        ImGui::SameLine();
+        const float dataSeconds = dataRateActive > 0 ? static_cast<float>(dataSavedFrames) / dataRateActive : 0.f;
+        ImGui::TextColored(ImVec4(0.3f, 0.6f, 1.0f, 1.0f), "DATA %.1fs", dataSeconds);
+    }
+    if (paused) {
+        ImGui::SameLine();
+        ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.2f, 1.0f), "PAUSED");
+    }
 
     ImGui::Spacing();
     const float buttonWidth = (ContentWidth - ImGui::GetStyle().ItemSpacing.x) * 0.5f;
     if (ImGui::Button("Restart", ImVec2(buttonWidth, 0.f))) RestartSimulation();
     ImGui::SameLine();
     if (ImGui::Button("Menu", ImVec2(buttonWidth, 0.f))) ReturnToMenu();
+
+    ImGui::Spacing();
+    if (ImGui::Button(paused ? "Resume" : "Pause", ImVec2(buttonWidth, 0.f))) TogglePause();
+    ImGui::SameLine();
+    if (ImGui::Button("Step", ImVec2(buttonWidth, 0.f))) StepOnce();
+    if (ImGui::Button("Step x10", ImVec2(ContentWidth, 0.f))) StepBig();
+    ImGui::TextDisabled("Space to pause, arrows to step");
 
     ImGui::Spacing();
     ImGui::Separator();
@@ -349,24 +478,21 @@ int main(int, char**) {
             profilerOpen = !profilerOpen;
             app.SetProfilerOpen(profilerOpen);
         }
+        // Drained every frame regardless of appState so a press queued during the menu (or while
+        // a text field had focus) never leaks into the next Running session.
+        const bool stepPressed    = app.TakeStepForward();
+        const bool bigStepPressed = app.TakeStepForwardBig();
+        const bool spacePressed   = app.TakeSpaceToggle();
 
         auto  now = Clock::now();
         float dt  = std::min(std::chrono::duration<float>(now - last).count(), 1.0f / 30.0f);
         last      = now;
 
         if (appState == AppState::Running) {
-            const auto& physics = ActiveScene.physics;
-            // Force is recomputed every forceInterval substeps (not once per frame, not every
-            // substep) — see Integrate()'s comment for why a stale force is a real energy-gain
-            // source, and why recomputing every substep was too expensive at this particle count.
-            const float subDt = dt / static_cast<float>(physics.substeps);
-            for (int step = 0; step < physics.substeps; step++) {
-                if (step % physics.forceInterval == 0) {
-                    for (auto& obj : objects) obj.acc = Vec2(0.0f, 0.0f);
-                    Update(subDt);
-                }
-                Integrate(subDt);
-            }
+            if (spacePressed)   TogglePause();
+            if (stepPressed)    StepOnce();
+            if (bigStepPressed) StepBig();
+            if (!paused)        AdvanceSimulation(dt);
         }
         profiler.MarkComputeEnd();
 
@@ -411,6 +537,28 @@ int main(int, char**) {
         if (appState == AppState::Running) {
             if (runIndex != lastRunIndex) { lastRunIndex = runIndex; runFrame = 0; }
             keByFrame.push_back({ runIndex, runFrame++, kineticEnergy });
+
+            if (dataRecorder.IsActive()) {
+                dataAccum += dt;
+                const float interval = 1.f / static_cast<float>(dataRateActive);
+                // Sampled on its own accumulator, independent of the render/physics rate, same as
+                // Recorder's fps gate for video — dataRate is usually far below the sim's own rate.
+                if (dataAccum >= interval) {
+                    dataAccum -= interval;
+
+                    std::vector<ParticleSample> samples;
+                    samples.reserve(objects.size());
+                    for (auto& obj : objects)
+                        samples.push_back({ obj.pos.x, obj.pos.y, obj.vel.x, obj.vel.y,
+                                             magnitude(obj.vel), obj.density, obj.pressure });
+
+                    dataRecorder.SubmitFrame(static_cast<int>(dataSavedFrames), dataElapsed, std::move(samples));
+                    dataSavedFrames++;
+                    if (dataLengthActive > 0.f && dataSavedFrames >= static_cast<uint32_t>(dataLengthActive * dataRateActive))
+                        dataRecorder.Stop();
+                }
+                dataElapsed += dt;
+            }
         }
 
         if (profiler.Tick()) {

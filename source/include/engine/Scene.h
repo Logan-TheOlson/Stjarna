@@ -48,7 +48,7 @@ struct SceneParticles {
 // a circle inscribed in a block of that size) of spacing-separated particles, centered vertically
 // and horizontally offset by offsetXFrac * the boundary's half-width.
 struct SceneSpawn {
-    int   gridCountX  = 100;
+    int   gridCountX  = 150;
     int   gridCountY  = 125;
     float offsetXFrac = 0.0f;
     bool  circular     = false;
