@@ -126,6 +126,13 @@ struct MenuConfig {
     bool  batchRender = false;
     int   sceneIndex = 2; // TEMP: testing Self-Gravity at 25k, revert to 0 before commit
 
+    // Particle grid override, applied via BuildScene() instead of the selected preset's own
+    // count — synced from the preset's default whenever sceneIndex changes (see DrawMenu), so
+    // switching scenes doesn't carry over an unrelated count left over from a previous selection.
+    int   gridCountX = 0;
+    int   gridCountY = 0;
+    bool  circularSpawn = false; // see the same comment: synced from the preset on scene change
+
     bool  saveData = false;
     char  dataTitle[128] = "data";
     int   dataRate = 30; // samples/sec, independent of render fps — see the "Save data to CSV" section
@@ -265,7 +272,9 @@ static void StepOnce() { paused = true; AdvanceSimulation(StepDt); }
 static void StepBig()  { paused = true; for (int i = 0; i < BigStepFrames; i++) AdvanceSimulation(StepDt); }
 
 static void StartSimulationFromMenu() {
-    LoadScene(ScenePresets[menuConfig.sceneIndex]);
+    Scene scene = BuildScene(menuConfig.sceneIndex, menuConfig.gridCountX, menuConfig.gridCountY);
+    scene.spawn.circular = menuConfig.circularSpawn;
+    LoadScene(scene);
     ResetSimulation();
     bool recording = false;
     if (menuConfig.record)
@@ -343,6 +352,34 @@ static void DrawMenu() {
         ImGui::EndCombo();
     }
     ImGui::TextWrapped("%s", selectedScene.description);
+
+    // Reset to the newly-selected preset's own count on every scene change (including the very
+    // first DrawMenu call, since lastSyncedSceneIndex starts at a value no real sceneIndex can
+    // equal) rather than carrying over whatever count an unrelated previous scene left behind.
+    static int lastSyncedSceneIndex = -1;
+    if (menuConfig.sceneIndex != lastSyncedSceneIndex) {
+        menuConfig.gridCountX    = selectedScene.spawn.gridCountX;
+        menuConfig.gridCountY    = selectedScene.spawn.gridCountY;
+        menuConfig.circularSpawn = selectedScene.spawn.circular;
+        lastSyncedSceneIndex     = menuConfig.sceneIndex;
+    }
+
+    ImGui::Separator();
+    ImGui::TextUnformatted("Particles");
+    ImGui::InputInt("Grid X", &menuConfig.gridCountX);
+    ImGui::InputInt("Grid Y", &menuConfig.gridCountY);
+    menuConfig.gridCountX = std::max(menuConfig.gridCountX, 1);
+    menuConfig.gridCountY = std::max(menuConfig.gridCountY, 1);
+    ImGui::Checkbox("Circular spawn (disk instead of a grid block)", &menuConfig.circularSpawn);
+    ImGui::TextDisabled("%d particles (grid X * grid Y%s)", menuConfig.gridCountX * menuConfig.gridCountY,
+                         menuConfig.circularSpawn ? ", packed into a disk" : "");
+    if (menuConfig.gridCountX * menuConfig.gridCountY > selectedScene.spawn.gridCountX * selectedScene.spawn.gridCountY * 4)
+        ImGui::TextColored(ImVec4(1.f, 0.7f, 0.2f, 1.f),
+                            "Well above this scene's tuned count — may be slow or unstable.");
+    if (menuConfig.circularSpawn != selectedScene.spawn.circular)
+        ImGui::TextColored(ImVec4(1.f, 0.7f, 0.2f, 1.f),
+                            "Differs from this scene's own spawn shape — any calibration tuned for "
+                            "the original shape (e.g. Self-Gravity's Lane-Emden fit) may not hold.");
 
     ImGui::Separator();
     ImGui::Checkbox("Record to video", &menuConfig.record);

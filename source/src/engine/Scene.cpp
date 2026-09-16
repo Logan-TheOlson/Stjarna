@@ -1,5 +1,6 @@
 #include "engine/Scene.h"
 #include "physics/Gravity.h"
+#include <algorithm>
 #include <cmath>
 
 // Defined in main.cpp — recomputes the SPH kernel constants (DensityNorm, PressureGradNorm, ...)
@@ -7,7 +8,7 @@
 void RecomputeSphConstants();
 
 namespace {
-    Scene MakeOpenTank() {
+    Scene MakeOpenTank(int gridCountX = 100, int gridCountY = 100) {
         Scene s{
             .name = "Open Tank",
             .description = "Full-window box; a centered block of fluid falls and settles.",
@@ -18,6 +19,8 @@ namespace {
         // effect, so opt back into the original free-slip walls explicitly rather than silently
         // inheriting ScenePhysics::noSlipWalls' default.
         s.physics.noSlipWalls = false;
+        s.spawn.gridCountX = gridCountX;
+        s.spawn.gridCountY = gridCountY;
         return s;
     }
 
@@ -28,16 +31,14 @@ namespace {
     // too — so the channel behaves as if it were infinitely long, the standard setup for this
     // test. Viscous drag against the walls (vs. the free interior) should develop into the classic
     // parabolic velocity profile: fastest at the channel's center, near-zero at the walls.
-    Scene MakePoiseuille() {
-        Scene s = MakeOpenTank();
+    Scene MakePoiseuille(int gridCountX = 280, int gridCountY = 22) {
+        Scene s = MakeOpenTank(gridCountX, gridCountY);
         s.name        = "Poiseuille Flow";
         s.description = "Periodic horizontal channel; a uniform force (no gravity) drives fluid "
                          "left-to-right, developing the classic parabolic velocity profile against "
                          "the no-slip walls.";
         s.boundary.heightFrac = 0.2f;
         s.boundary.periodicX  = true;
-        s.spawn.gridCountX    = 280;
-        s.spawn.gridCountY    = 22;
         // Tuned so the plug settles into equilibrium quickly and at a speed still slow enough to
         // watch: higher viscosity damps the initial transient faster (and pulls the eventual
         // plug speed down on its own), lower force pulls the terminal speed down further on top
@@ -53,8 +54,8 @@ namespace {
     // is mutual N-body attraction between particles, via the genuine-2D treecode, plus SPH
     // pressure resisting the collapse. Default window boundaries (full-window box, free-slip
     // walls from MakeOpenTank), so the block has room to contract before it ever reaches a wall.
-    Scene MakeSelfGravity() {
-        Scene s = MakeOpenTank();
+    Scene MakeSelfGravity(int gridCountX = 250, int gridCountY = 200) {
+        Scene s = MakeOpenTank(gridCountX, gridCountY);
         s.name        = "Self-Gravity";
         s.description = "No external force; particles pull on each other via a genuine 2D (1/r) "
                          "self-gravity treecode while SPH pressure resists the collapse.";
@@ -85,8 +86,10 @@ namespace {
         // this is a no-op — the knob to turn for a different resolution. (gridCountX/Y need not be
         // square-ish: circular spawn only ever uses their product, see Init()'s circular branch.)
         constexpr int OldCount = 100 * 100;
-        s.spawn.gridCountX = 250;
-        s.spawn.gridCountY = 200; // 250*200 == 50000
+        // s.spawn.gridCountX/Y are already gridCountX/gridCountY, set via the MakeOpenTank(...)
+        // call above — default 250*200 == 50000, the resolution this scene's K/alpha calibration
+        // below was validated against; any other count just re-derives the same calibration at
+        // that count's own scale (see the comment block below).
         const float scale = std::sqrt(static_cast<float>(OldCount)
                                      / static_cast<float>(s.spawn.gridCountX * s.spawn.gridCountY));
         s.particles.circleRadius    *= scale;
@@ -108,8 +111,10 @@ namespace {
         // the original 10k baseline was validated stable at). A finer grid (smaller
         // smoothingRadius, stiffer EOS to match) pushes this scene's characteristic CFL number
         // (soundspeed/smoothingRadius, evaluated at targetDensity) up sharply — 50k particles (5x
-        // the 10k baseline) was separately measured to need 96 substeps (8x). Revisit if
-        // gridCountX/Y above change again.
+        // the 10k baseline) was separately measured to need 96 substeps (8x). Fixed regardless of
+        // gridCountX/gridCountY above (not re-derived from the CFL number per count), so a much
+        // larger user-chosen count than the 50k this was tuned at may need more than 96 to stay
+        // stable — not auto-scaled here.
         s.physics.substeps = 96;
 
         // Softening ~= smoothing radius, same "avoids the 1/r^2 singularity at ~mean interparticle
@@ -174,6 +179,17 @@ namespace {
 const std::vector<Scene> ScenePresets = {
     MakeOpenTank(), MakePoiseuille(), MakeSelfGravity(),
 };
+
+Scene BuildScene(int presetIndex, int gridCountX, int gridCountY) {
+    gridCountX = std::max(gridCountX, 1);
+    gridCountY = std::max(gridCountY, 1);
+    switch (presetIndex) {
+        case 0:  return MakeOpenTank(gridCountX, gridCountY);
+        case 1:  return MakePoiseuille(gridCountX, gridCountY);
+        case 2:  return MakeSelfGravity(gridCountX, gridCountY);
+        default: return ScenePresets[presetIndex];
+    }
+}
 
 Scene ActiveScene = ScenePresets[0];
 

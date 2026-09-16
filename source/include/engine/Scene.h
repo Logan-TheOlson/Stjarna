@@ -104,6 +104,13 @@ struct Scene {
 
 extern const std::vector<Scene> ScenePresets;
 
+// Rebuilds ScenePresets[presetIndex] with its particle grid resized to gridCountX x gridCountY
+// instead of the preset's own default count — re-deriving whatever calibration depends on that
+// count (e.g. MakeSelfGravity's mass/softening/stiffness scaling), not just overwriting
+// SceneSpawn's fields on a copy, which would leave a resolution-dependent scene tuned for the
+// wrong count. gridCountX/Y are clamped to >= 1.
+Scene BuildScene(int presetIndex, int gridCountX, int gridCountY);
+
 // The scene currently governing physics/spawn/boundary. Mutable — set via LoadScene(), not
 // assigned directly, so derived SPH kernel constants (main.cpp's RecomputeSphConstants) stay in
 // sync with it.
