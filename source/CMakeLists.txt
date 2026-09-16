@@ -112,9 +112,12 @@ add_executable(${NAME}
     src/util/ThreadPool.cpp
     src/util/Recorder.cpp
     src/util/DataRecorder.cpp
+    src/util/Vector.cpp
+    src/physics/GravityParams.cpp
+    src/physics/Quadtree.cpp
+    src/physics/Gravity.cpp
     resource.rc
     Stjarna.manifest
-        src/util/Vector.cpp
 )
 
 target_include_directories(${NAME} PRIVATE include)

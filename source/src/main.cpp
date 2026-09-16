@@ -6,6 +6,7 @@
 #include "engine/Engine.h"
 #include "engine/Scene.h"
 #include "Config.h"
+#include "physics/Gravity.h"
 #include "util/ThreadPool.h"
 
 // ----------- Spatial partitioning
@@ -29,7 +30,7 @@ namespace {
     std::vector<int32_t>  rawCellX, rawCellY;   // per real particle, scratch for BuildGrid
     std::vector<uint32_t> rawHash;
 
-    std::vector<Vec2>    hotPos, hotVel, hotForce;
+    std::vector<Vec2>    hotPos, hotVel, hotForce, hotGravAcc;
     std::vector<float>   hotDensity, hotPressure;
     std::vector<int32_t> hotToReal;    // hot slot -> index into `objects`
     std::vector<int32_t> cellX, cellY; // per hot slot, integer cell coords
@@ -80,6 +81,7 @@ static void BuildGrid() {
     hotDensity.resize(n);
     hotPressure.resize(n);
     hotForce.resize(n);
+    hotGravAcc.resize(n);
 
     cursor.assign(cellStart.begin(), cellStart.end() - 1);
     for (int32_t i = 0; i < n; i++) {
@@ -229,6 +231,7 @@ namespace {
     float DensityNorm      = 0.f;
     float PressureGradNorm = 0.f;
     float SoundSpeed       = 0.f;
+    float PolytropicGamma  = 0.f; // 1 + 1/polytropicIndex; only used when eos == Polytropic
 }
 
 // Recomputes every SPH constant derived from ActiveScene.particles. Called by LoadScene()
@@ -245,7 +248,21 @@ void RecomputeSphConstants() {
     const float radius9 = radius6 * RadiusSq * Radius;
     DensityNorm      = 315.f / (64.f * Pi * radius9);
     PressureGradNorm = -45.f / (Pi * radius6);
-    SoundSpeed       = std::sqrt(ActiveScene.particles.stiffness);
+    PolytropicGamma  = 1.f + 1.f / ActiveScene.particles.polytropicIndex;
+
+    // Characteristic speed for the artificial-viscosity term (CalculatePressureForce), not an
+    // exact per-particle quantity — just a reference sqrt(dP/drho). WCSPH's stiffness IS
+    // approximately that (c^2 ~ stiffness by construction), but the Polytropic EOS's stiffness is
+    // K in pressure=K*density^gamma, a completely different scale (~1e23 for this sim's Self-Gravity
+    // calibration, vs WCSPH's ~1e4) — sqrt(K) directly would give a nonsense "sound speed" and blow
+    // the viscosity term up on the first substep. Evaluate the real dP/drho = K*gamma*rho^(gamma-1)
+    // at targetDensity instead.
+    if (ActiveScene.particles.eos == EosModel::Polytropic) {
+        const auto& p = ActiveScene.particles;
+        SoundSpeed = std::sqrt(p.stiffness * PolytropicGamma * std::pow(p.targetDensity, PolytropicGamma - 1.f));
+    } else {
+        SoundSpeed = std::sqrt(ActiveScene.particles.stiffness);
+    }
 }
 
 // Poly6-style kernel. Takes squared distance directly — callers already have it, and the kernel
@@ -279,16 +296,24 @@ static float IntPow (float base, int exp)
 // --------- Calculations
 // Operate on hot-array slots; Object is untouched until Update() scatters the results back.
 
-static void CalculatePressure (int32_t k) // Calculate pressure
+static void CalculatePressure (int32_t k)
 {
     const auto& p = ActiveScene.particles;
-    float frac = p.stiffness * p.targetDensity * (1.f / p.exponent);
-    float parenth = IntPow(hotDensity[k] / p.targetDensity, p.exponent) - 1;
+    if (p.eos == EosModel::Polytropic) {
+        // Pure polytrope: no targetDensity offset, so unlike WCSPH below there's nothing to clamp
+        // — density is always > 0 (CalculateDensity always includes the dist==0 self-term), and a
+        // positive base raised to any real exponent stays positive.
+        hotPressure[k] = p.stiffness * std::pow(hotDensity[k], PolytropicGamma);
+        return;
+    }
+
+    const float frac = p.stiffness * p.targetDensity * (1.f / p.exponent);
+    const float parenth = IntPow(hotDensity[k] / p.targetDensity, p.exponent) - 1;
     // Clamp negative pressure so that it is never attractive
     hotPressure[k] = std::max(0.f, frac * parenth);
 }
 
-static void CalculateDensity (int32_t k) // Calculates local density at a particle
+static void CalculateDensity (int32_t k)
 {
     const Vec2 pos = hotPos[k];
     float density = 0.f;
@@ -370,25 +395,29 @@ void Init() {
     const float radius  = particles.circleRadius;
     const float spacing = radius * 3.0f;
     const float centerX = spawn.offsetXFrac * ScreenHalfWidth();
-    const float startX  = centerX - (spawn.gridCountX - 1) * spacing / 2.0f;
-    const float startY  = -(spawn.gridCountY - 1) * spacing / 2.0f;
 
     auto spawnAt = [&](float x, float y) {
         CreateObject(x, y, Renderable{ .color = particles.circleColor, .shader = Shader::Circle, .geometry = Circle{radius} });
     };
 
     if (spawn.circular) {
-        // A circle inscribed in the gridCountX x gridCountY block, sampled on the same lattice.
-        const float halfW = (spawn.gridCountX - 1) * spacing / 2.0f;
-        const float halfH = (spawn.gridCountY - 1) * spacing / 2.0f;
-        const float rSq   = std::min(halfW, halfH) * std::min(halfW, halfH);
-        for (int x = 0; x < spawn.gridCountX; x++)
-            for (int y = 0; y < spawn.gridCountY; y++) {
-                const float px = startX + static_cast<float>(x) * spacing;
-                const float py = startY + static_cast<float>(y) * spacing;
-                if ((px - centerX) * (px - centerX) + py * py <= rSq) spawnAt(px, py);
-            }
+        // Exactly gridCountX*gridCountY particles, placed directly into a disk via a Fibonacci
+        // ("sunflower"/Vogel) spiral instead of masking a square lattice against a circle -- that
+        // approach only ever approximates the requested count (a circle inscribed in an NxN square
+        // keeps just ~pi/4 of its points). The disk radius is sized so its areal density matches
+        // the square lattice's (one particle per spacing^2), preserving the initial SPH density
+        // this scene's constants were calibrated against.
+        const int   count      = spawn.gridCountX * spawn.gridCountY;
+        const float diskRadius = spacing * std::sqrt(static_cast<float>(count) / Pi);
+        constexpr float GoldenAngle = 2.39996323f; // pi * (3 - sqrt(5))
+        for (int i = 0; i < count; i++) {
+            const float r     = diskRadius * std::sqrt((static_cast<float>(i) + 0.5f) / static_cast<float>(count));
+            const float theta = static_cast<float>(i) * GoldenAngle;
+            spawnAt(centerX + r * std::cos(theta), r * std::sin(theta));
+        }
     } else {
+        const float startX = centerX - (spawn.gridCountX - 1) * spacing / 2.0f;
+        const float startY = -(spawn.gridCountY - 1) * spacing / 2.0f;
         for (int x = 0; x < spawn.gridCountX; x++)
             for (int y = 0; y < spawn.gridCountY; y++)
                 spawnAt(startX + static_cast<float>(x) * spacing, startY + static_cast<float>(y) * spacing);
@@ -409,6 +438,25 @@ void Update(float) {
         for (int32_t k = begin; k < end; k++) CalculatePressureForce(k);
     });
 
+    // Self-gravity, on top of the SPH pressure force above — off for most scenes (see
+    // SceneGravity), so only pay for a tree build/traversal when a scene actually wants it.
+    const auto& grav = ActiveScene.gravity;
+    if (grav.enabled) {
+        if (grav.method == GravityMethod::Genuine2D) {
+            Gravity::BuildTree(hotPos, n);
+            ParallelFor(n, [](int32_t begin, int32_t end) {
+                for (int32_t k = begin; k < end; k++) hotGravAcc[k] = Gravity::EvaluateForce2D(k, hotPos);
+            });
+            if (grav.validate) Gravity::ValidateAccuracy2D(hotPos, n, 500);
+        } else {
+            Gravity::BuildTree(hotPos, n);
+            ParallelFor(n, [](int32_t begin, int32_t end) {
+                for (int32_t k = begin; k < end; k++) hotGravAcc[k] = Gravity::EvaluateForce(k, hotPos);
+            });
+            if (grav.validate) Gravity::ValidateAccuracy(hotPos, n, 500);
+        }
+    }
+
     // Scatter hot results back onto the real objects.
     const Vec2 force = ActiveScene.physics.force;
     for (int32_t k = 0; k < n; k++) {
@@ -417,5 +465,6 @@ void Update(float) {
         o.pressure  = hotPressure[k];
         o.acc      += hotForce[k];
         o.acc      += force;
+        if (grav.enabled) o.acc += hotGravAcc[k];
     }
 }

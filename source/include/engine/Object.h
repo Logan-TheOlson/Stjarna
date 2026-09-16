@@ -15,6 +15,8 @@ struct Object {
     float Radius() const;
     // colorOverride, when non-null, is drawn instead of renderable.color — used to recolor
     // particles by a live field (speed/pressure/density) without touching the scene's own color.
-    void  Draw(App& app, const Color* colorOverride = nullptr) const;
+    // xOverride, when non-null, is drawn instead of pos.x — used by the camera-follow display
+    // offset (Engine.cpp) so the on-screen position can differ from the simulated one.
+    void  Draw(App& app, const Color* colorOverride = nullptr, const float* xOverride = nullptr) const;
 };
 

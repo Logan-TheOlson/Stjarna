@@ -5,6 +5,7 @@
 #include <imgui.h>
 #include <imgui_impl_sdl3.h>
 #include <imgui_impl_vulkan.h>
+#include <algorithm>
 #include <iostream>
 #include <vector>
 #include <cstdio>
@@ -338,6 +339,62 @@ void VulkanContext::RecreateSwapchain() {
     CreateSwapchain();
 }
 
+void VulkanContext::EnsureOffscreenTarget(uint32_t w, uint32_t h) {
+    if (offscreenImage != VK_NULL_HANDLE && offscreenExtent.width == w && offscreenExtent.height == h) return;
+    DestroyOffscreenTarget();
+
+    VkImageCreateInfo imgCI{
+        .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+        .imageType = VK_IMAGE_TYPE_2D, .format = imageFormat,
+        .extent = { w, h, 1 }, .mipLevels = 1, .arrayLayers = 1,
+        .samples = VK_SAMPLE_COUNT_1_BIT, .tiling = VK_IMAGE_TILING_OPTIMAL,
+        .usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+        .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+        .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+    };
+    chk(vkCreateImage(device, &imgCI, nullptr, &offscreenImage));
+
+    VkMemoryRequirements memReq{};
+    vkGetImageMemoryRequirements(device, offscreenImage, &memReq);
+    VkPhysicalDeviceMemoryProperties memProps{};
+    vkGetPhysicalDeviceMemoryProperties(physicalDevice, &memProps);
+    uint32_t memTypeIndex = UINT32_MAX;
+    for (uint32_t i = 0; i < memProps.memoryTypeCount; i++) {
+        if ((memReq.memoryTypeBits & (1u << i)) &&
+            (memProps.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) {
+            memTypeIndex = i;
+            break;
+        }
+    }
+    if (memTypeIndex == UINT32_MAX) { std::cerr << "No suitable memory type for offscreen render target\n"; exit(1); }
+    VkMemoryAllocateInfo allocInfo{
+        .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+        .allocationSize = memReq.size, .memoryTypeIndex = memTypeIndex,
+    };
+    chk(vkAllocateMemory(device, &allocInfo, nullptr, &offscreenMemory));
+    chk(vkBindImageMemory(device, offscreenImage, offscreenMemory, 0));
+
+    VkImageViewCreateInfo ivCI{
+        .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .image = offscreenImage,
+        .viewType = VK_IMAGE_VIEW_TYPE_2D, .format = imageFormat,
+        .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 },
+    };
+    chk(vkCreateImageView(device, &ivCI, nullptr, &offscreenView));
+
+    offscreenExtent = { w, h };
+    offscreenEverRendered = false;
+}
+
+void VulkanContext::DestroyOffscreenTarget() {
+    if (offscreenImage == VK_NULL_HANDLE) return;
+    vkDeviceWaitIdle(device);
+    vkDestroyImageView(device, offscreenView, nullptr);
+    vkDestroyImage(device, offscreenImage, nullptr);
+    vkFreeMemory(device, offscreenMemory, nullptr);
+    offscreenView = VK_NULL_HANDLE; offscreenImage = VK_NULL_HANDLE; offscreenMemory = VK_NULL_HANDLE;
+    offscreenExtent = {};
+}
+
 void VulkanContext::CreateShapePipeline(const char* vertSpv, const char* fragSpv,
                                         VkDescriptorSetLayout descSetLayout,
                                         VkPipelineLayout& outLayout, VkPipeline& outPipeline) {
@@ -561,12 +618,17 @@ void VulkanContext::RenderFrame(float dt) {
     if (acq == VK_ERROR_OUT_OF_DATE_KHR || acq == VK_SUBOPTIMAL_KHR) { RecreateSwapchain(); circles.clear(); rects.clear(); return; }
     if (acq != VK_SUCCESS) chk(acq);
 
-    // Paces captured frames against real elapsed time (dt) rather than the render loop's actual
-    // rate, so the output video's duration matches wall-clock time regardless of the app's fps.
+    // Paces captured frames against `dt` rather than the render loop's actual call rate, so the
+    // output video's duration matches `dt`'s accumulated total regardless of the app's fps. Only
+    // applies while captureFromSwapchain_ is set (the live-recording path, driven from Running) —
+    // during batch rendering, RenderOffscreenFrame does the actual per-video-frame capture and
+    // this function is only called once per real tick to refresh the progress overlay, so it must
+    // not also capture: circles/rects are already cleared by then, so a capture here would splice
+    // a blank frame into the video (see SetCaptureFromSwapchain).
     bool capturingThisFrame = false;
     bool stopRecordingAfterSubmit = false;
     int  captureSlot = -1;
-    if (recorder_.IsActive()) {
+    if (recorder_.IsActive() && captureFromSwapchain_) {
         const float interval = 1.f / static_cast<float>(recordFps_);
         recordAccum_ += dt;
         // If the background reader hasn't finished with the next slot yet, skip capturing this
@@ -597,19 +659,22 @@ void VulkanContext::RenderFrame(float dt) {
     };
     vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0, 0, nullptr, 0, nullptr, 1, &toRender);
 
-    VkRenderingAttachmentInfo colorAtt{
+    // Pass 1: the simulated scene only (circles/rects). Ends and gets captured (if capturing)
+    // BEFORE ImGui ever draws, so a live-only overlay (the batch-render progress print used to be
+    // a progress bar here, and the profiler HUD below) can never contaminate the recorded video —
+    // see Engine.cpp's AdvanceRendering, which relies on exactly this.
+    VkRenderingAttachmentInfo sceneAtt{
         .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
         .imageView = imageViews[imageIndex], .imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
         .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR, .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
         .clearValue = { .color = { .float32 = { 0.169f, 0.204f, 0.267f, 1.0f } } }, // #2b3444
     };
-    VkRenderingInfo renderingInfo{
+    VkRenderingInfo sceneRenderingInfo{
         .sType = VK_STRUCTURE_TYPE_RENDERING_INFO,
         .renderArea = { {0,0}, swapchainExtent },
-        .layerCount = 1, .colorAttachmentCount = 1, .pColorAttachments = &colorAtt,
+        .layerCount = 1, .colorAttachmentCount = 1, .pColorAttachments = &sceneAtt,
     };
-    vkCmdBeginRendering(cb, &renderingInfo);
-
+    vkCmdBeginRendering(cb, &sceneRenderingInfo);
     {
         VkViewport viewport{ 0, 0, (float)swapchainExtent.width, (float)swapchainExtent.height, 0.0f, 1.0f };
         VkRect2D   scissor{ {0,0}, swapchainExtent };
@@ -636,9 +701,6 @@ void VulkanContext::RenderFrame(float dt) {
             vkCmdDraw(cb, 6, n, 0, 0);
         }
     }
-
-    ImGui_ImplVulkan_RenderDrawData(ImGui::GetDrawData(), cb);
-
     vkCmdEndRendering(cb);
     circles.clear();
     rects.clear();
@@ -659,24 +721,42 @@ void VulkanContext::RenderFrame(float dt) {
         };
         vkCmdCopyImageToBuffer(cb, images[imageIndex], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, captureBuffers_[captureSlot], 1, &region);
 
-        VkImageMemoryBarrier toPresent{
+        // Back to COLOR_ATTACHMENT_OPTIMAL, not PRESENT_SRC — pass 2 (ImGui) below still needs to
+        // draw into this image before it's actually presented.
+        VkImageMemoryBarrier backToColor{
             .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-            .srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT, .dstAccessMask = 0,
-            .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, .newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+            .srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT, .dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+            .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, .newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
             .image = images[imageIndex], .subresourceRange = range,
         };
-        vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 0, nullptr, 0, nullptr, 1, &toPresent);
+        vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0, 0, nullptr, 0, nullptr, 1, &backToColor);
 
         pendingCaptureSlot_ = captureSlot;
-    } else {
-        VkImageMemoryBarrier toPresent{
-            .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-            .srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, .dstAccessMask = 0,
-            .oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, .newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
-            .image = images[imageIndex], .subresourceRange = range,
-        };
-        vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 0, nullptr, 0, nullptr, 1, &toPresent);
     }
+
+    // Pass 2: ImGui on top — shown live (including over a batch render, see AdvanceRendering),
+    // but drawn after pass 1 was already captured above, so it never reaches the recorded frame.
+    VkRenderingAttachmentInfo uiAtt{
+        .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
+        .imageView = imageViews[imageIndex], .imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+        .loadOp = VK_ATTACHMENT_LOAD_OP_LOAD, .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
+    };
+    VkRenderingInfo uiRenderingInfo{
+        .sType = VK_STRUCTURE_TYPE_RENDERING_INFO,
+        .renderArea = { {0,0}, swapchainExtent },
+        .layerCount = 1, .colorAttachmentCount = 1, .pColorAttachments = &uiAtt,
+    };
+    vkCmdBeginRendering(cb, &uiRenderingInfo);
+    ImGui_ImplVulkan_RenderDrawData(ImGui::GetDrawData(), cb);
+    vkCmdEndRendering(cb);
+
+    VkImageMemoryBarrier toPresent{
+        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+        .srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, .dstAccessMask = 0,
+        .oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, .newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+        .image = images[imageIndex], .subresourceRange = range,
+    };
+    vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 0, nullptr, 0, nullptr, 1, &toPresent);
 
     chk(vkEndCommandBuffer(cb));
 
@@ -690,6 +770,114 @@ void VulkanContext::RenderFrame(float dt) {
     else if (presentResult != VK_SUCCESS) chk(presentResult);
 
     if (stopRecordingAfterSubmit) StopRecording();
+}
+
+// See the header comment — renders straight to offscreenImage and captures it, touching neither
+// the swapchain nor ImGui, so a batch render can't be throttled by vsync or by the OS treating an
+// occluded/backgrounded window as lower priority: there's simply nothing on screen to throttle.
+void VulkanContext::RenderOffscreenFrame() {
+    if (!recorder_.IsActive()) { circles.clear(); rects.clear(); return; }
+
+    EnsureOffscreenTarget(recordWidth_, recordHeight_);
+
+    chk(vkWaitForFences(device, 1, &fence, VK_TRUE, UINT64_MAX));
+    FlushPendingCapture();
+
+    // Same "drop rather than stall" policy as RenderFrame()'s capture path.
+    if (captureSlotBusy_[captureWriteIndex_].load()) { circles.clear(); rects.clear(); return; }
+    const int captureSlot = captureWriteIndex_;
+    captureWriteIndex_ = (captureWriteIndex_ + 1) % kCaptureSlots;
+    captureSlotBusy_[captureSlot] = true;
+    recordedFrames_++;
+    const bool stopAfter = recordLengthSeconds_ > 0.f
+                          && recordedFrames_ >= static_cast<uint32_t>(recordLengthSeconds_ * recordFps_);
+
+    chk(vkResetFences(device, 1, &fence));
+    chk(vkResetCommandBuffer(cb, 0));
+    VkCommandBufferBeginInfo cbbi{ .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT };
+    chk(vkBeginCommandBuffer(cb, &cbbi));
+
+    VkImageSubresourceRange range{ VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+    VkImageMemoryBarrier toRender{
+        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+        .srcAccessMask = offscreenEverRendered ? VK_ACCESS_TRANSFER_READ_BIT : VkAccessFlags(0),
+        .dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+        // Every frame after the first left the image in TRANSFER_SRC_OPTIMAL (its own capture
+        // copy, below); only the very first frame starts from UNDEFINED.
+        .oldLayout = offscreenEverRendered ? VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL : VK_IMAGE_LAYOUT_UNDEFINED,
+        .newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+        .image = offscreenImage, .subresourceRange = range,
+    };
+    vkCmdPipelineBarrier(cb, offscreenEverRendered ? VK_PIPELINE_STAGE_TRANSFER_BIT : VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                          VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0, 0, nullptr, 0, nullptr, 1, &toRender);
+    offscreenEverRendered = true;
+
+    VkRenderingAttachmentInfo att{
+        .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
+        .imageView = offscreenView, .imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+        .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR, .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
+        .clearValue = { .color = { .float32 = { 0.169f, 0.204f, 0.267f, 1.0f } } }, // #2b3444
+    };
+    VkRenderingInfo ri{
+        .sType = VK_STRUCTURE_TYPE_RENDERING_INFO,
+        .renderArea = { {0,0}, offscreenExtent },
+        .layerCount = 1, .colorAttachmentCount = 1, .pColorAttachments = &att,
+    };
+    vkCmdBeginRendering(cb, &ri);
+    {
+        VkViewport viewport{ 0, 0, (float)offscreenExtent.width, (float)offscreenExtent.height, 0.0f, 1.0f };
+        VkRect2D   scissor{ {0,0}, offscreenExtent };
+        vkCmdSetViewport(cb, 0, 1, &viewport);
+        vkCmdSetScissor(cb, 0, 1, &scissor);
+
+        float invScreen[2] = { 2.0f / offscreenExtent.width, 2.0f / offscreenExtent.height };
+
+        if (!circles.empty()) {
+            const uint32_t n = (uint32_t)circles.size();
+            memcpy(circleMapped, circles.data(), n * sizeof(CircleData));
+            vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, circlePipeline);
+            vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, circlePipelineLayout, 0, 1, &circleDescSet, 0, nullptr);
+            vkCmdPushConstants(cb, circlePipelineLayout, VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(invScreen), invScreen);
+            vkCmdDraw(cb, 6, n, 0, 0);
+        }
+
+        if (!rects.empty()) {
+            const uint32_t n = (uint32_t)rects.size();
+            memcpy(rectMapped, rects.data(), n * sizeof(RectData));
+            vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, rectPipeline);
+            vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, rectPipelineLayout, 0, 1, &rectDescSet, 0, nullptr);
+            vkCmdPushConstants(cb, rectPipelineLayout, VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(invScreen), invScreen);
+            vkCmdDraw(cb, 6, n, 0, 0);
+        }
+    }
+    vkCmdEndRendering(cb);
+    circles.clear();
+    rects.clear();
+
+    VkImageMemoryBarrier toTransferSrc{
+        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+        .srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
+        .oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, .newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+        .image = offscreenImage, .subresourceRange = range,
+    };
+    vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &toTransferSrc);
+
+    VkBufferImageCopy region{
+        .bufferOffset = 0, .bufferRowLength = 0, .bufferImageHeight = 0,
+        .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
+        .imageOffset = { 0, 0, 0 }, .imageExtent = { offscreenExtent.width, offscreenExtent.height, 1 },
+    };
+    vkCmdCopyImageToBuffer(cb, offscreenImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, captureBuffers_[captureSlot], 1, &region);
+
+    chk(vkEndCommandBuffer(cb));
+
+    // No semaphores — nothing external (swapchain acquire/present) to synchronize against.
+    VkSubmitInfo si{ .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &cb };
+    chk(vkQueueSubmit(queue, 1, &si, fence));
+
+    pendingCaptureSlot_ = captureSlot;
+
+    if (stopAfter) StopRecording();
 }
 
 void VulkanContext::Shutdown() {
@@ -714,6 +902,7 @@ void VulkanContext::Shutdown() {
     vkDestroySemaphore(device, renderSem, nullptr);
     vkDestroySemaphore(device, acquireSem, nullptr);
     vkDestroyCommandPool(device, commandPool, nullptr);
+    DestroyOffscreenTarget();
     for (auto& iv : imageViews) vkDestroyImageView(device, iv, nullptr);
     vkDestroySwapchainKHR(device, swapchain, nullptr);
     vkDestroySurfaceKHR(instance, surface, nullptr);

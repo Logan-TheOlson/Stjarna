@@ -33,6 +33,13 @@ public:
     void  StopRecording()                { vk.StopRecording(); }
     bool  IsRecording()            const { return vk.IsRecording(); }
     float RecordedSeconds()        const { return vk.RecordedSeconds(); }
+    // See VulkanContext::SetCaptureFromSwapchain — must be set false while batch rendering so the
+    // per-tick overlay-refresh RenderFrame() call doesn't splice blank frames into the video.
+    void  SetCaptureFromSwapchain(bool enable) { vk.SetCaptureFromSwapchain(enable); }
+    // See VulkanContext::RenderOffscreenFrame — draws+captures a video frame with no swapchain or
+    // window involvement at all, so a batch render can't be throttled by vsync or by the window
+    // being occluded/backgrounded.
+    void  RenderOffscreenFrame()         { vk.RenderOffscreenFrame(); }
 
 private:
     Window        window;

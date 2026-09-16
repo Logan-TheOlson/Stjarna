@@ -38,6 +38,22 @@ public:
     bool  IsRecording() const { return recorder_.IsActive(); }
     float RecordedSeconds() const { return recordFps_ > 0 ? static_cast<float>(recordedFrames_) / recordFps_ : 0.f; }
 
+    // Batch rendering (see Engine.cpp's AdvanceRendering) drives capture entirely through
+    // RenderOffscreenFrame, but the main loop still calls RenderFrame once per real tick to keep
+    // the progress overlay on screen. Without this flag RenderFrame's own capture gate would fire
+    // too (recorder_.IsActive() is still true), copying that swapchain frame — which is just the
+    // overlay, since circles/rects were already cleared by the offscreen pass — into the video as
+    // a blank frame spliced in among the real ones. False while batch rendering; true otherwise.
+    void  SetCaptureFromSwapchain(bool enable) { captureFromSwapchain_ = enable; }
+
+    // Renders the scene (not UI) straight to an offscreen target and captures it, with no
+    // swapchain/present involvement at all — unlike RenderFrame(), this can't be throttled by
+    // vsync or by the OS deprioritizing an occluded/backgrounded window, since nothing is ever
+    // shown on screen. Every call captures unconditionally (no fps-interval gating — the caller,
+    // AdvanceRendering, already only calls this once per intended video frame) and auto-stops the
+    // recording via the same length cap StartRecording() set up. A no-op if no recording is active.
+    void RenderOffscreenFrame();
+
 private:
     // SSBO instance data â€” world-space coords; NDC computed in vertex shader via push constants
     struct CircleData {
@@ -77,6 +93,19 @@ private:
     VkSwapchainKHR         swapchain{ VK_NULL_HANDLE };
     std::vector<VkImage>   images;
     std::vector<VkImageView> imageViews;
+
+    // RenderOffscreenFrame()'s render target — same format as the swapchain, sized to match it at
+    // StartRecording() time (see recordWidth_/recordHeight_) and recreated only if that changes.
+    VkImage        offscreenImage{ VK_NULL_HANDLE };
+    VkDeviceMemory offscreenMemory{ VK_NULL_HANDLE };
+    VkImageView    offscreenView{ VK_NULL_HANDLE };
+    VkExtent2D     offscreenExtent{};
+    // Whether offscreenImage has ever been rendered to — its very first barrier transitions from
+    // UNDEFINED, every one after that from TRANSFER_SRC_OPTIMAL (where the previous frame's
+    // capture copy left it).
+    bool           offscreenEverRendered{ false };
+    void EnsureOffscreenTarget(uint32_t w, uint32_t h);
+    void DestroyOffscreenTarget();
 
     VkCommandPool   commandPool{ VK_NULL_HANDLE };
     VkCommandBuffer cb{ VK_NULL_HANDLE };
@@ -140,6 +169,7 @@ private:
     std::atomic<bool> captureSlotBusy_[kCaptureSlots]{};
     int               captureWriteIndex_{ 0 };
     int               pendingCaptureSlot_{ -1 }; // slot the most recent submission copied into, not yet handed to Recorder
+    bool              captureFromSwapchain_{ true }; // see SetCaptureFromSwapchain
 
     // Hands pendingCaptureSlot_ (if any) to Recorder and clears it. Only valid to call once the
     // GPU copy into that slot is known to have finished (i.e. after a fence wait or

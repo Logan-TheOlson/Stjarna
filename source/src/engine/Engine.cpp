@@ -9,6 +9,8 @@
 #include <array>
 #include <cctype>
 #include <chrono>
+#include <cmath>
+#include <cstdio>
 #include <filesystem>
 #include <fstream>
 #include <string>
@@ -88,15 +90,26 @@ static App      app;
 static Profiler profiler;
 static bool     profilerOpen = false;
 
-// Simulation only advances in Running; Menu leaves `objects` untouched (cleared) and skips
-// physics entirely so the menu screen never pays SPH cost.
-enum class AppState { Menu, Running };
+// Simulation only advances in Running/Rendering; Menu leaves `objects` untouched (cleared) and
+// skips physics entirely so the menu screen never pays SPH cost. Rendering runs the same physics
+// as Running, but crunched back-to-back at a fixed 1/fps dt and always drawn+captured straight to
+// video — no real-time pacing, and no live playback afterward (see AdvanceRendering/
+// DrawRenderingOverlay).
+enum class AppState { Menu, Running, Rendering };
 static AppState appState = AppState::Menu;
 
 // Freezes physics (rendering, recording, and CSV data-saving all keep running) — toggled by
 // Space or the Pause/Resume button. Independent of appState so a paused sim stays paused across
 // UI redraws; only Restart/Menu/StartSimulation touch it.
 static bool paused = false;
+
+// Periodic-channel scenes (Poiseuille) drift the whole particle cloud sideways as the imposed
+// force advects it, which makes the pressure-driven profile (fast center, slow walls) hard to
+// read — it's buried under the bulk translation. When enabled, the drawn (not simulated) x
+// position is offset by the accumulated mean flow velocity each substep (see Integrate), so the
+// cloud appears stationary on average and only the relative motion between fast/slow bands shows.
+static bool  cameraFollow  = true;
+static float cameraOffsetX = 0.f;
 
 constexpr float StepDt         = 1.f / 60.f; // fixed nominal frame length for manual stepping, so a
                                               // step is deterministic regardless of real elapsed time
@@ -107,7 +120,11 @@ struct MenuConfig {
     char  title[128] = "capture";
     int   fps = 60;
     float lengthSeconds = 10.f;
-    int   sceneIndex = 0;
+    // Only meaningful alongside `record`: renders+captures every frame back-to-back at 1/fps
+    // instead of pacing to real time, so the video finishes in however long that takes to compute
+    // rather than lengthSeconds of real time — see AdvanceRendering.
+    bool  batchRender = false;
+    int   sceneIndex = 2; // TEMP: testing Self-Gravity at 25k, revert to 0 before commit
 
     bool  saveData = false;
     char  dataTitle[128] = "data";
@@ -142,6 +159,13 @@ static std::string SanitizeFilename(const char* raw, const char* fallback) {
 // Identifies which Start-Simulation/Restart session a KESample belongs to (see WriteKineticEnergyCsv).
 static int runIndex = -1;
 
+// Accumulated across the process's lifetime and written once at shutdown (see main()) — file
+// scope (not a main()-local) so DrawAndSubmitFrame can push to it from both Running's per-real-
+// frame call site and AdvanceRendering's per-video-frame one.
+static std::vector<KESample> keByFrame;
+static int lastRunIndexForKE = -1;
+static int runFrameForKE     = 0;
+
 // Live coloring: recolors every particle by a current simulation field instead of its scene
 // color, so a fast flow (e.g. Poiseuille) is readable even when it's moving too fast to track
 // individual particles. Each field gets its own low/high color pair, independently editable, so
@@ -172,6 +196,37 @@ static Color LerpColor(const Color& a, const Color& b, float t) {
     return { a.r + (b.r - a.r) * t, a.g + (b.g - a.g) * t, a.b + (b.b - a.b) * t, 1.f };
 }
 
+// The mode + gradient picker that decides how DrawAndSubmitFrame colors particles — shared by
+// DrawRunningOverlay (the live corner panel) and DrawMenu's Record section, so a batch render
+// (which never visits Running) still gets a chance to set this before the video starts, not just
+// whatever colorMode happened to be left over from a previous live session.
+static void DrawColorByControls(float contentWidth) {
+    const float swatchSize = ImGui::GetFrameHeight();
+
+    ImGui::TextUnformatted("Color by");
+    ImGui::SetNextItemWidth(contentWidth);
+    int modeIdx = static_cast<int>(colorMode);
+    if (ImGui::Combo("##colorby", &modeIdx, ColorModeNames, IM_ARRAYSIZE(ColorModeNames)))
+        colorMode = static_cast<ColorMode>(modeIdx);
+
+    if (colorMode != ColorMode::Off) {
+        ColorRamp& ramp = colorRamps[modeIdx];
+        ImGui::Spacing();
+
+        // Label on the left, swatch pinned to the content's right edge — NoInputs leaves just the
+        // swatch button here, all sliders live in the popup it opens.
+        ImGui::AlignTextToFramePadding();
+        ImGui::TextUnformatted("Low");
+        ImGui::SameLine(contentWidth - swatchSize);
+        ImGui::ColorEdit3("##low", &ramp.low.r, ImGuiColorEditFlags_NoInputs);
+
+        ImGui::AlignTextToFramePadding();
+        ImGui::TextUnformatted("High");
+        ImGui::SameLine(contentWidth - swatchSize);
+        ImGui::ColorEdit3("##high", &ramp.high.r, ImGuiColorEditFlags_NoInputs);
+    }
+}
+
 // Defined further down (needs ScreenHalfWidth/Height); forward-declared so AdvanceSimulation can
 // call it despite living earlier in the file, next to the other pause/step/menu logic.
 static void Integrate(float subDt);
@@ -181,6 +236,7 @@ static void ResetSimulation() {
     Init();
     runIndex++;
     paused = false;
+    cameraOffsetX = 0.f;
 }
 
 // Advances one substep loop's worth of physics by dt — factored out of the main loop so manual
@@ -211,8 +267,9 @@ static void StepBig()  { paused = true; for (int i = 0; i < BigStepFrames; i++) 
 static void StartSimulationFromMenu() {
     LoadScene(ScenePresets[menuConfig.sceneIndex]);
     ResetSimulation();
+    bool recording = false;
     if (menuConfig.record)
-        app.StartRecording(menuConfig.title, menuConfig.fps, menuConfig.lengthSeconds);
+        recording = app.StartRecording(menuConfig.title, menuConfig.fps, menuConfig.lengthSeconds);
     if (menuConfig.saveData) {
         DataRecorder::Fields fields;
         fields.position = menuConfig.dataPosition;
@@ -233,7 +290,19 @@ static void StartSimulationFromMenu() {
             dataSavedFrames  = 0;
         }
     }
-    appState = AppState::Running;
+
+    // batchRender only makes sense with an active recording to drive it — if StartRecording()
+    // failed (e.g. ffmpeg missing), fall back to Running rather than entering a Rendering state
+    // that would just find app.IsRecording() false immediately and bounce straight back to Menu.
+    if (recording && menuConfig.batchRender) {
+        // AdvanceRendering captures every video frame itself via RenderOffscreenFrame; the
+        // per-tick RenderFrame() call (see main()) is only there to keep the progress overlay on
+        // screen and must not also feed the recorder — see SetCaptureFromSwapchain.
+        app.SetCaptureFromSwapchain(false);
+        appState = AppState::Rendering;
+    } else {
+        appState = AppState::Running;
+    }
 }
 
 // Resets the sim in place without leaving Running (and without touching any active recording or
@@ -246,6 +315,9 @@ static void ReturnToMenu() {
     app.StopRecording();
     dataRecorder.Stop();
     objects.clear();
+    // Restore the default so the next live recording (Running, not batchRender) captures normally
+    // — only batch rendering ever turns this off.
+    app.SetCaptureFromSwapchain(true);
     appState = AppState::Menu;
 }
 
@@ -281,6 +353,19 @@ static void DrawMenu() {
         ImGui::InputFloat("Length (s, 0 = unlimited)", &menuConfig.lengthSeconds, 1.0f, 10.0f, "%.0f");
         menuConfig.lengthSeconds = std::max(menuConfig.lengthSeconds, 0.f);
         ImGui::TextDisabled("Saved to recordings/<title>.mp4 (requires ffmpeg on PATH)");
+
+        ImGui::Checkbox("Render as fast as possible (no live playback)", &menuConfig.batchRender);
+        if (menuConfig.batchRender)
+            ImGui::TextDisabled("Computes and saves the video directly at FPS/Length above, taking\n"
+                                 "however long that takes to compute instead of that many real\n"
+                                 "seconds. Cancel button (or Space) stops it early.");
+
+        // Batch-rendered video never visits Running's live "Controls" panel, so without this a
+        // batch render could only ever use the scene's plain color — set it here instead, before
+        // the video starts. Applies to a live recording too, just redundant with the panel there.
+        // 260px to match the "Start Simulation" button below (the window auto-sizes to content).
+        ImGui::Spacing();
+        DrawColorByControls(260.f);
     }
 
     ImGui::Separator();
@@ -312,6 +397,31 @@ static void DrawMenu() {
     ImGui::End();
 }
 
+// Safe to draw now that VulkanContext::RenderFrame captures the video frame in a first pass and
+// only draws ImGui in a second one on top — this overlay lands in that second pass, so unlike
+// before it never reaches the recorded video no matter how long it stays on screen.
+static void DrawRenderingOverlay() {
+    const ImGuiIO& io = ImGui::GetIO();
+    ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f, io.DisplaySize.y * 0.5f), ImGuiCond_Always, ImVec2(0.5f, 0.5f));
+    ImGui::SetNextWindowBgAlpha(0.9f);
+    ImGui::Begin("Rendering", nullptr, ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoCollapse);
+
+    ImGui::TextUnformatted(ActiveScene.name);
+    const float recorded = app.RecordedSeconds();
+    if (menuConfig.lengthSeconds > 0.f) {
+        ImGui::Text("%.1f / %.1f seconds rendered", recorded, menuConfig.lengthSeconds);
+        const float frac = std::clamp(recorded / menuConfig.lengthSeconds, 0.f, 1.f);
+        ImGui::ProgressBar(frac, ImVec2(260.f, 0.f));
+    } else {
+        ImGui::Text("%.1f seconds rendered (unlimited length)", recorded);
+    }
+    ImGui::TextDisabled("Rendering as fast as possible, straight to video —\nno live playback follows.");
+
+    if (ImGui::Button("Cancel", ImVec2(260.f, 0.f))) ReturnToMenu();
+
+    ImGui::End();
+}
+
 static void DrawRunningOverlay() {
     const ImGuiIO& io = ImGui::GetIO();
     ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x - 10.f, 10.f), ImGuiCond_Always, ImVec2(1.f, 0.f));
@@ -322,9 +432,8 @@ static void DrawRunningOverlay() {
 
     // Fixed content width (rather than whatever the widest row happens to auto-size to) so the
     // panel doesn't visibly resize when the color-by rows appear/disappear, and so the row-content
-    // computations below (button/combo/swatch alignment) have a stable width to work from.
+    // computations below (button/combo alignment) have a stable width to work from.
     constexpr float ContentWidth = 240.f;
-    const float     swatchSize   = ImGui::GetFrameHeight();
 
     ImGui::TextUnformatted(ActiveScene.name);
     if (app.IsRecording()) {
@@ -354,32 +463,17 @@ static void DrawRunningOverlay() {
     if (ImGui::Button("Step x10", ImVec2(ContentWidth, 0.f))) StepBig();
     ImGui::TextDisabled("Space to pause, arrows to step");
 
+    if (ActiveScene.boundary.periodicX) {
+        ImGui::Spacing();
+        ImGui::Checkbox("Follow flow (camera)", &cameraFollow);
+        ImGui::TextDisabled("Cancels bulk drift so the profile's relative\nmotion reads as motion instead of scrolling past");
+    }
+
     ImGui::Spacing();
     ImGui::Separator();
     ImGui::Spacing();
 
-    ImGui::TextUnformatted("Color by");
-    ImGui::SetNextItemWidth(ContentWidth);
-    int modeIdx = static_cast<int>(colorMode);
-    if (ImGui::Combo("##colorby", &modeIdx, ColorModeNames, IM_ARRAYSIZE(ColorModeNames)))
-        colorMode = static_cast<ColorMode>(modeIdx);
-
-    if (colorMode != ColorMode::Off) {
-        ColorRamp& ramp = colorRamps[modeIdx];
-        ImGui::Spacing();
-
-        // Label on the left, swatch pinned to the content's right edge — NoInputs leaves just the
-        // swatch button here, all sliders live in the popup it opens.
-        ImGui::AlignTextToFramePadding();
-        ImGui::TextUnformatted("Low");
-        ImGui::SameLine(ContentWidth - swatchSize);
-        ImGui::ColorEdit3("##low", &ramp.low.r, ImGuiColorEditFlags_NoInputs);
-
-        ImGui::AlignTextToFramePadding();
-        ImGui::TextUnformatted("High");
-        ImGui::SameLine(ContentWidth - swatchSize);
-        ImGui::ColorEdit3("##high", &ramp.high.r, ImGuiColorEditFlags_NoInputs);
-    }
+    DrawColorByControls(ContentWidth);
 
     ImGui::End();
 }
@@ -433,6 +527,17 @@ static void resolveAxis(float& p, float& v, float& vt, float half, float r) {
     if (hit && physics.noSlipWalls) vt *= 1.0f - physics.friction;
 }
 
+// Wraps x into (-hw, hw], the same range periodicX teleporting keeps simulated positions in —
+// used to fold the camera-follow display offset back into range regardless of how far it's
+// accumulated, rather than only handling a single wrap like the simulated-position teleport does.
+static float WrapX(float x, float hw) {
+    const float span = 2.f * hw;
+    if (span <= 0.f) return x;
+    x = std::fmod(x + hw, span);
+    if (x < 0.f) x += span;
+    return x - hw;
+}
+
 // Integrates a single substep, reusing whatever force (particle.acc) the last Update() call
 // computed — held constant across ActiveScene.physics.forceInterval substeps at a time to trade
 // some staleness back for compute cost. acc is reset only when it's about to be recomputed
@@ -440,6 +545,7 @@ static void resolveAxis(float& p, float& v, float& vt, float half, float r) {
 static void Integrate(float subDt) {
     const float hw = ScreenHalfWidth(), hh = ScreenHalfHeight();
     const bool  periodicX = ActiveScene.boundary.periodicX;
+    double sumVx = 0.0; // mean flow velocity this substep, for the camera-follow display offset
     for (auto& obj : objects) {
         const float r = obj.Radius();
         obj.vel += obj.acc * subDt;
@@ -449,28 +555,146 @@ static void Integrate(float subDt) {
             // channel behaves like an infinite domain rather than a wall.
             if      (obj.pos.x >  hw) obj.pos.x -= 2.f * hw;
             else if (obj.pos.x < -hw) obj.pos.x += 2.f * hw;
+            sumVx += obj.vel.x;
         } else {
             resolveAxis(obj.pos.x, obj.vel.x, obj.vel.y, hw, r);
         }
         resolveAxis(obj.pos.y, obj.vel.y, obj.vel.x, hh, r);
     }
+    if (periodicX && cameraFollow && !objects.empty()) {
+        cameraOffsetX += static_cast<float>(sumVx / objects.size()) * subDt;
+        cameraOffsetX  = WrapX(cameraOffsetX, hw);
+    }
+}
+
+// Draws the current particles/boundary and submits the frame (capturing it if a video recording
+// is active), then records the per-frame bookkeeping (kinetic-energy history, CSV data sample) —
+// one call is exactly one simulated+rendered(+captured) frame, at whatever dt physics was just
+// advanced by. Running calls this once per real frame; AdvanceRendering calls it back-to-back at
+// a fixed 1/fps dt instead, with no pacing to real time and no ImGui overlay drawn over it (an
+// overlay would get baked straight into the captured video — see VulkanContext::RenderFrame).
+static void DrawAndSubmitFrame(float dt, bool offscreen) {
+    const bool coloring = colorMode != ColorMode::Off && !objects.empty();
+    float kineticEnergy = 0.f;
+    float colorLo = 0.f, colorHi = 0.f;
+    if (coloring) colorLo = colorHi = FieldValue(objects[0], colorMode);
+    for (auto& obj : objects) {
+        kineticEnergy += 0.5f * (obj.vel.x * obj.vel.x + obj.vel.y * obj.vel.y);
+        if (coloring) {
+            const float v = FieldValue(obj, colorMode);
+            colorLo = std::min(colorLo, v);
+            colorHi = std::max(colorHi, v);
+        }
+    }
+
+    // Display-only x shift (see Integrate's cameraOffsetX accumulation) — never touches obj.pos,
+    // so physics/CSV/data-save all still see true simulated positions.
+    const bool  followCam = ActiveScene.boundary.periodicX && cameraFollow;
+    const float hw        = ScreenHalfWidth();
+    if (coloring) {
+        // Auto-scaled to the current frame's range rather than a fixed scale — the field's
+        // magnitude varies wildly across scenes (and over a Poiseuille run's own ramp-up), so a
+        // fixed range would either clip everything to one end or wash out early on.
+        const ColorRamp& ramp = colorRamps[static_cast<int>(colorMode)];
+        const float range = colorHi - colorLo;
+        for (auto& obj : objects) {
+            float t = range > 0.f ? (FieldValue(obj, colorMode) - colorLo) / range : 0.f;
+            Color c = LerpColor(ramp.low, ramp.high, t);
+            if (followCam) {
+                float dispX = WrapX(obj.pos.x - cameraOffsetX, hw);
+                obj.Draw(app, &c, &dispX);
+            } else {
+                obj.Draw(app, &c);
+            }
+        }
+    } else {
+        for (auto& obj : objects) {
+            if (followCam) {
+                float dispX = WrapX(obj.pos.x - cameraOffsetX, hw);
+                obj.Draw(app, nullptr, &dispX);
+            } else {
+                obj.Draw(app);
+            }
+        }
+    }
+    DrawBoundary(app);
+
+    // Batch rendering (see AdvanceRendering) never touches the swapchain/window at all — offscreen
+    // draws+captures every frame unconditionally instead, so it can't be throttled by vsync or by
+    // the OS deprioritizing an occluded/backgrounded window.
+    if (offscreen) app.RenderOffscreenFrame();
+    else           app.RenderFrame(dt);
+    app.SetObjectCount(static_cast<int>(objects.size()));
+    app.SetKineticEnergy(kineticEnergy);
+
+    if (runIndex != lastRunIndexForKE) { lastRunIndexForKE = runIndex; runFrameForKE = 0; }
+    keByFrame.push_back({ runIndex, runFrameForKE++, kineticEnergy });
+
+    if (dataRecorder.IsActive()) {
+        dataAccum += dt;
+        const float interval = 1.f / static_cast<float>(dataRateActive);
+        // Sampled on its own accumulator, independent of the render/physics rate, same as
+        // Recorder's fps gate for video — dataRate is usually far below the sim's own rate.
+        if (dataAccum >= interval) {
+            dataAccum -= interval;
+
+            std::vector<ParticleSample> samples;
+            samples.reserve(objects.size());
+            for (auto& obj : objects)
+                samples.push_back({ obj.pos.x, obj.pos.y, obj.vel.x, obj.vel.y,
+                                     magnitude(obj.vel), obj.density, obj.pressure });
+
+            dataRecorder.SubmitFrame(static_cast<int>(dataSavedFrames), dataElapsed, std::move(samples));
+            dataSavedFrames++;
+            if (dataLengthActive > 0.f && dataSavedFrames >= static_cast<uint32_t>(dataLengthActive * dataRateActive))
+                dataRecorder.Stop();
+        }
+        dataElapsed += dt;
+    }
+}
+
+// Crunches physics AND rendering/capture back-to-back at a fixed 1/fps dt instead of pacing to
+// real time, so a video finishes as fast as the CPU/GPU can produce it rather than taking
+// lengthSeconds of real time. Draws+captures offscreen (see DrawAndSubmitFrame/
+// RenderOffscreenFrame) — no swapchain/window involvement, so nothing here can be throttled by
+// vsync or by the OS deprioritizing an occluded/backgrounded window. Relies on the recorder's own
+// length cap to know when it's done — once app.IsRecording() goes false (length reached, or
+// Cancel's StopRecording()), there's no live playback to fall into, so this goes straight back to
+// Menu. Still budgeted to a wall-clock slice per call so the main loop's PollEvents() keeps the
+// window responsive during a long render instead of hanging; the caller separately refreshes the
+// on-screen progress overlay once per real tick (a plain, cheap swapchain present, decoupled from
+// this loop's own pace) rather than this loop touching the swapchain itself.
+static void AdvanceRendering() {
+    using Clock = std::chrono::steady_clock;
+    const auto  budgetStart            = Clock::now();
+    constexpr float FrameBudgetSeconds = 1.f / 30.f;
+    const float frameDt = 1.f / static_cast<float>(std::max(menuConfig.fps, 1));
+
+    while (app.IsRecording()) {
+        AdvanceSimulation(frameDt);
+        DrawAndSubmitFrame(frameDt, /*offscreen=*/true);
+        if (std::chrono::duration<float>(Clock::now() - budgetStart).count() >= FrameBudgetSeconds)
+            break;
+    }
+
+    if (!app.IsRecording()) ReturnToMenu(); // StopRecording() here is a no-op, already stopped itself
 }
 
 int main(int, char**) {
     app.Init(Config::WindowTitle, Config::WindowWidth, Config::WindowHeight);
     app.SetUICallback([]() {
-        if (appState == AppState::Menu) DrawMenu();
-        else                            DrawRunningOverlay();
+        switch (appState) {
+            case AppState::Menu:      DrawMenu(); break;
+            case AppState::Running:   DrawRunningOverlay(); break;
+            case AppState::Rendering: DrawRenderingOverlay(); break;
+        }
     });
 
     objects.reserve(100000);
+    keByFrame.reserve(1u << 16); // avoid mid-run reallocations from skewing frame timing
 
     using Clock = std::chrono::steady_clock;
     auto last = Clock::now();
-
-    std::vector<KESample> keByFrame;
-    keByFrame.reserve(1u << 16); // avoid mid-run reallocations from skewing frame timing
-    int lastRunIndex = runIndex, runFrame = 0;
 
     profiler.MarkFrameStart();
     while (app.PollEvents()) {
@@ -492,73 +716,29 @@ int main(int, char**) {
             if (spacePressed)   TogglePause();
             if (stepPressed)    StepOnce();
             if (bigStepPressed) StepBig();
-            if (!paused)        AdvanceSimulation(dt);
-        }
-        profiler.MarkComputeEnd();
-
-        // Single scan for both the running kinetic energy (always needed) and, when a color-by
-        // mode is active, that field's frame range — folded together rather than a dedicated pass
-        // just for the min/max, since both need every particle visited once before drawing anyway.
-        const bool coloring = colorMode != ColorMode::Off && !objects.empty();
-        float kineticEnergy = 0.f;
-        float colorLo = 0.f, colorHi = 0.f;
-        if (coloring) colorLo = colorHi = FieldValue(objects[0], colorMode);
-        for (auto& obj : objects) {
-            kineticEnergy += 0.5f * (obj.vel.x * obj.vel.x + obj.vel.y * obj.vel.y);
-            if (coloring) {
-                const float v = FieldValue(obj, colorMode);
-                colorLo = std::min(colorLo, v);
-                colorHi = std::max(colorHi, v);
+            if (!paused) AdvanceSimulation(dt);
+            profiler.MarkComputeEnd();
+            DrawAndSubmitFrame(dt, /*offscreen=*/false);
+            profiler.MarkRenderEnd();
+        } else if (appState == AppState::Rendering) {
+            // Same key Running uses for pause/resume; the Cancel button in DrawRenderingOverlay
+            // does the same thing.
+            if (spacePressed) {
+                ReturnToMenu();
+            } else {
+                profiler.MarkComputeEnd();
+                AdvanceRendering();
+                profiler.MarkRenderEnd();
             }
-        }
-
-        if (coloring) {
-            // Auto-scaled to the current frame's range rather than a fixed scale — the field's
-            // magnitude varies wildly across scenes (and over a Poiseuille run's own ramp-up), so a
-            // fixed range would either clip everything to one end or wash out early on.
-            const ColorRamp& ramp = colorRamps[static_cast<int>(colorMode)];
-            const float range = colorHi - colorLo;
-            for (auto& obj : objects) {
-                float t = range > 0.f ? (FieldValue(obj, colorMode) - colorLo) / range : 0.f;
-                Color c = LerpColor(ramp.low, ramp.high, t);
-                obj.Draw(app, &c);
-            }
+            // Refreshes the progress overlay (or, if AdvanceRendering just finished, the menu) —
+            // deliberately separate from AdvanceRendering's own offscreen capture loop above, so
+            // showing it only costs one swapchain acquire/present per real tick, not one per video
+            // frame captured within that tick's budget.
+            app.RenderFrame(dt);
         } else {
-            for (auto& obj : objects)
-                obj.Draw(app);
-        }
-        if (appState == AppState::Running) DrawBoundary(app);
-
-        app.RenderFrame(dt);
-        profiler.MarkRenderEnd();
-        app.SetObjectCount(static_cast<int>(objects.size()));
-
-        app.SetKineticEnergy(kineticEnergy);
-        if (appState == AppState::Running) {
-            if (runIndex != lastRunIndex) { lastRunIndex = runIndex; runFrame = 0; }
-            keByFrame.push_back({ runIndex, runFrame++, kineticEnergy });
-
-            if (dataRecorder.IsActive()) {
-                dataAccum += dt;
-                const float interval = 1.f / static_cast<float>(dataRateActive);
-                // Sampled on its own accumulator, independent of the render/physics rate, same as
-                // Recorder's fps gate for video — dataRate is usually far below the sim's own rate.
-                if (dataAccum >= interval) {
-                    dataAccum -= interval;
-
-                    std::vector<ParticleSample> samples;
-                    samples.reserve(objects.size());
-                    for (auto& obj : objects)
-                        samples.push_back({ obj.pos.x, obj.pos.y, obj.vel.x, obj.vel.y,
-                                             magnitude(obj.vel), obj.density, obj.pressure });
-
-                    dataRecorder.SubmitFrame(static_cast<int>(dataSavedFrames), dataElapsed, std::move(samples));
-                    dataSavedFrames++;
-                    if (dataLengthActive > 0.f && dataSavedFrames >= static_cast<uint32_t>(dataLengthActive * dataRateActive))
-                        dataRecorder.Stop();
-                }
-                dataElapsed += dt;
-            }
+            app.RenderFrame(dt); // Menu: just the UI, no particles/bookkeeping
+            profiler.MarkComputeEnd();
+            profiler.MarkRenderEnd();
         }
 
         if (profiler.Tick()) {
