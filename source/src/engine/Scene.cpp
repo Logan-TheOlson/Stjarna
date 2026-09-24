@@ -21,6 +21,9 @@ namespace {
         s.physics.noSlipWalls = false;
         s.spawn.gridCountX = gridCountX;
         s.spawn.gridCountY = gridCountY;
+        // Measured real-time-stable grid size on the developer's own machine.
+        s.realTimeLimitX = 125;
+        s.realTimeLimitY = 125;
         return s;
     }
 
@@ -47,6 +50,10 @@ namespace {
         s.physics.noSlipWalls   = true; // the wall drag this whole scene exists to demonstrate
         s.particles.viscosity   = 4.0f;
         s.particles.circleColor = { 0.2f, 0.9f, 0.8f, 1.0f };
+        // Not independently measured — this scene's own (long, thin) default grid, inherited
+        // from MakeOpenTank's square 125x125 otherwise being a poor fit for its channel shape.
+        s.realTimeLimitX = 280;
+        s.realTimeLimitY = 22;
         return s;
     }
 
@@ -63,6 +70,11 @@ namespace {
 
         s.gravity.enabled  = true;
         s.gravity.method   = GravityMethod::Genuine2D;
+
+        // This scene's own default grid is also the exact count its substep count (see below)
+        // and K/alpha calibration (see the Xi1 comment below) were validated at running smoothly.
+        s.realTimeLimitX = 250;
+        s.realTimeLimitY = 200;
 
         // Circular spawn: a radially symmetric initial condition settles into a radially symmetric
         // equilibrium, which is what a Lane-Emden comparison (spherically/circularly symmetric by

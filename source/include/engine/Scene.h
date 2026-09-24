@@ -100,6 +100,13 @@ struct Scene {
     SceneGravity    gravity;
     SceneParticles  particles;
     SceneSpawn      spawn;
+
+    // Real-Time Limit: hand-tuned grid size this scene stays smooth/stable at in real time on
+    // the developer's own machine — not measured by the sim itself, just shown for reference in
+    // the menu (Engine.cpp's DrawMenu). Independent of spawn.gridCountX/Y (the scene's own
+    // default count), since BuildScene() only overrides the latter.
+    int             realTimeLimitX = 0;
+    int             realTimeLimitY = 0;
 };
 
 extern const std::vector<Scene> ScenePresets;

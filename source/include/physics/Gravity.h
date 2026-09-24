@@ -38,9 +38,16 @@ Vec2 DirectSumGravity(int32_t selfIdx, const std::vector<Vec2>& pos, int32_t n);
 // counts.
 Vec2 DirectSumGravity2D(int32_t selfIdx, const std::vector<Vec2>& pos, int32_t n);
 
-// O(n^2) total gravitational potential energy, -G * sum_{i<j} m_i*m_j / sqrt(r_ij^2 + softening^2).
-// Intended for energy-drift monitoring on small particle counts only.
+// O(n^2) total gravitational potential energy for the 3D-restricted-to-the-plane (1/r^2 force)
+// law, -G * sum_{i<j} m_i*m_j / sqrt(r_ij^2 + softening^2) — matches EvaluateForce()/
+// DirectSumGravity(). Intended for energy-drift monitoring on small particle counts only.
 float DirectSumPotentialEnergy(const std::vector<Vec2>& pos, int32_t n);
+
+// The genuine-2D counterpart of DirectSumPotentialEnergy() above, for the log-potential (1/r
+// force) law: G * sum_{i<j} m_i*m_j * ln(r_ij^2 + softening^2) — matches EvaluateForce2D()/
+// DirectSumGravity2D(). Using DirectSumPotentialEnergy() while Genuine2D is the active method (as
+// it is for every scene that enables gravity) gives a physically meaningless energy-drift plot.
+float DirectSumPotentialEnergy2D(const std::vector<Vec2>& pos, int32_t n);
 
 // Compares EvaluateForce() against DirectSumGravity() over the first
 // `sampleCount` particles and logs the max/mean relative error to stdout.

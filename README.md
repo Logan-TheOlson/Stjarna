@@ -84,20 +84,28 @@ void Update(float dt) {
     for (auto& b : objects) {
         const float r = b.Radius();
         // clamp + reflect off screen edges, per axis
-        if (b.pos.x - r < -hw) { b.pos.x = -hw + r; if (b.vel.x < 0.0f) b.vel.x *= -Config::Physics::Restitution; }
+        if (b.pos.x - r < -hw) { b.pos.x = -hw + r; if (b.vel.x < 0.0f) b.vel.x *= -ActiveScene.physics.restitution; }
         // ...
     }
 }
 ```
 
-## Configuration (`Config.h`)
+## Configuration (`Config.h` / `Scene.h`)
+
+`Config.h` only holds window setup:
 
 ```cpp
-Config::WindowWidth / WindowHeight
-Config::Physics::Restitution        // bounce coefficient
-Config::Physics::Friction
-Config::Physics::Substeps           // integration substeps per frame
-Config::Particles::SmoothingRadius  // SPH kernel smoothing radius
+Config::WindowTitle / WindowWidth / WindowHeight
+```
+
+Everything tunable per-run — boundaries, spawn layout, gravity, and the physics/particle constants
+below — lives in `Scene.h`/`Scene.cpp` as runtime scene presets, read off `ActiveScene`:
+
+```cpp
+ActiveScene.physics.restitution     // bounce coefficient
+ActiveScene.physics.friction
+ActiveScene.physics.substeps        // integration substeps per frame
+ActiveScene.particles.smoothingRadius  // SPH kernel smoothing radius
 ```
 
 ## Dependencies

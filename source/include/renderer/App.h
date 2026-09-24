@@ -26,6 +26,10 @@ public:
     int   Height()     const;
     float HalfWidth()  const;
     float HalfHeight() const;
+    // See VulkanContext::RecordingHalfWidth/Height — what the simulation's own boundary math
+    // should use instead of HalfWidth()/HalfHeight() while a recording is active.
+    float RecordingHalfWidth()  const { return vk.RecordingHalfWidth(); }
+    float RecordingHalfHeight() const { return vk.RecordingHalfHeight(); }
 
     // Starts (or restarts) recording the composited frame to <recordingsDir>/<title>.mp4 via
     // ffmpeg. lengthSeconds <= 0 means "until StopRecording() is called".

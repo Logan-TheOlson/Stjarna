@@ -182,6 +182,18 @@ float DirectSumPotentialEnergy(const std::vector<Vec2>& pos, int32_t n) {
     return pe;
 }
 
+float DirectSumPotentialEnergy2D(const std::vector<Vec2>& pos, int32_t n) {
+    float pe = 0.f;
+    for (int32_t i = 0; i < n; i++) {
+        for (int32_t j = i + 1; j < n; j++) {
+            const Vec2  d   = pos[i] - pos[j];
+            const float rr2 = dot(d, d) + Eps2;
+            pe += (G * Mass * Mass) * std::log(rr2);
+        }
+    }
+    return pe;
+}
+
 void ValidateAccuracy(const std::vector<Vec2>& pos, int32_t n, int32_t sampleCount) {
     const int32_t count = std::min(sampleCount, n);
     float maxRelErr = 0.f, sumRelErr = 0.f;

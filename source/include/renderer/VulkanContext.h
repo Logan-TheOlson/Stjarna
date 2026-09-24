@@ -30,6 +30,19 @@ public:
     float HalfWidth()  const { return swapchainExtent.width  * 0.5f; }
     float HalfHeight() const { return swapchainExtent.height * 0.5f; }
 
+    // The half-extents the simulation itself should measure its boundary against: pinned to the
+    // active recording's fixed resolution (recordWidth_/recordHeight_) while one is in progress,
+    // since that's the coordinate system the captured video frame actually uses — the live
+    // swapchain can still change size underneath a batch render (see RecreateSwapchain), and
+    // using HalfWidth()/HalfHeight() directly there would draw the boundary (and bounce particles
+    // off walls) at a position that no longer matches where the fixed-size recorded frame puts
+    // its own edges, splitting the border into visible stray lines partway through the video.
+    // Live (non-batch) recording never actually hits this divergence — a swapchain resize there
+    // stops the recording outright (see RecreateSwapchain) before hw/hh can drift — but pinning
+    // unconditionally whenever IsRecording() is simpler than special-casing which capture mode.
+    float RecordingHalfWidth()  const { return recorder_.IsActive() ? recordWidth_  * 0.5f : HalfWidth(); }
+    float RecordingHalfHeight() const { return recorder_.IsActive() ? recordHeight_ * 0.5f : HalfHeight(); }
+
     // Captures the composited (scene + UI) swapchain image at `fps`, pacing capture against real
     // time (via RenderFrame's dt) rather than the render loop's actual rate. lengthSeconds <= 0
     // means "record until StopRecording() is called".
@@ -90,9 +103,30 @@ private:
     VkColorSpaceKHR  colorSpace{ VK_COLORSPACE_SRGB_NONLINEAR_KHR };
     VkExtent2D       swapchainExtent{};
 
+    // Sample count the scene (circle/rect) pass renders at, chosen once in Init() from what the
+    // device actually supports (falls back to VK_SAMPLE_COUNT_1_BIT, i.e. no MSAA, if 4x isn't
+    // available). This anti-aliases more than each shape's own edge (see circle.frag's smoothstep
+    // rim, which already handled that) — at high particle counts, particles shrink to a couple of
+    // pixels across and their arrangement (e.g. the Vogel/Fibonacci spiral MakeSelfGravity's
+    // circular spawn uses) becomes a near-regular point lattice; sampling it at only one point per
+    // pixel aliases that regularity into a visible moiré "screen" pattern that per-shape edge AA
+    // can't touch. Multisampling the whole pass softens that by sampling coverage several times
+    // per pixel before resolving down to one color, the same fix a renderer would use for any
+    // dense, regular geometry — see swapchainMsaaImage/offscreenMsaaImage below.
+    VkSampleCountFlagBits sceneSampleCount{ VK_SAMPLE_COUNT_1_BIT };
+
     VkSwapchainKHR         swapchain{ VK_NULL_HANDLE };
     std::vector<VkImage>   images;
     std::vector<VkImageView> imageViews;
+
+    // Multisampled color target the scene pass actually draws into when sceneSampleCount > 1,
+    // resolved into imageViews[imageIndex] as part of the same pass (see RecordScenePass) — never
+    // read from directly (no copy, no present), so its contents don't need to survive between
+    // frames; recreated alongside imageViews whenever CreateSwapchain() runs. Left at VK_NULL_HANDLE
+    // for the lifetime of the app if the device doesn't support sceneSampleCount's sample count.
+    VkImage        swapchainMsaaImage{ VK_NULL_HANDLE };
+    VkDeviceMemory swapchainMsaaMemory{ VK_NULL_HANDLE };
+    VkImageView    swapchainMsaaView{ VK_NULL_HANDLE };
 
     // RenderOffscreenFrame()'s render target — same format as the swapchain, sized to match it at
     // StartRecording() time (see recordWidth_/recordHeight_) and recreated only if that changes.
@@ -100,6 +134,11 @@ private:
     VkDeviceMemory offscreenMemory{ VK_NULL_HANDLE };
     VkImageView    offscreenView{ VK_NULL_HANDLE };
     VkExtent2D     offscreenExtent{};
+    // offscreenImage's MSAA counterpart — same role/lifetime as swapchainMsaaImage above, just
+    // sized to/recreated alongside the offscreen target instead of the swapchain.
+    VkImage        offscreenMsaaImage{ VK_NULL_HANDLE };
+    VkDeviceMemory offscreenMsaaMemory{ VK_NULL_HANDLE };
+    VkImageView    offscreenMsaaView{ VK_NULL_HANDLE };
     // Whether offscreenImage has ever been rendered to — its very first barrier transitions from
     // UNDEFINED, every one after that from TRANSFER_SRC_OPTIMAL (where the previous frame's
     // capture copy left it).
@@ -179,6 +218,18 @@ private:
 
     void CreateSwapchain();
     void RecreateSwapchain();
+    // The circle/rect draw pass shared verbatim by RenderFrame() and RenderOffscreenFrame() —
+    // clears `drawView` and draws the current circles/rects into it at `extent`, then clears both
+    // vectors. Doesn't begin/end the command buffer or touch barriers; callers own those (including
+    // transitioning `drawView`'s image to COLOR_ATTACHMENT_OPTIMAL beforehand).
+    //
+    // `resolveView` is VK_NULL_HANDLE when sceneSampleCount is 1 (no MSAA support): `drawView` is
+    // then the final single-sample target and this behaves exactly like the pre-MSAA version — load
+    // /clear/store it directly, no resolve. Otherwise `drawView` must be the matching MSAA target
+    // (swapchainMsaaView/offscreenMsaaView) and `resolveView` the final single-sample image the
+    // multisampled result resolves into as part of this same pass; the MSAA image itself is left
+    // DONT_CARE since nothing ever reads it back.
+    void RecordScenePass(VkImageView drawView, VkImageView resolveView, VkExtent2D extent);
     void CreateShapePipeline(const char* vertSpv, const char* fragSpv,
                              VkDescriptorSetLayout descSetLayout,
                              VkPipelineLayout& outLayout, VkPipeline& outPipeline);
@@ -189,4 +240,13 @@ private:
     // magnitude slower than reads from normal (cached) system memory.
     void CreateSSBO(VkDeviceSize size, VkBufferUsageFlags usage, VkMemoryPropertyFlags preferred,
                     VkBuffer& buf, VkDeviceMemory& mem, void*& mapped, bool* outCoherent = nullptr);
+
+    // Shared image+memory+view allocation for any of this class's device-local color attachments
+    // (offscreenImage, and now the MSAA targets below) — `usage` distinguishes the ones that also
+    // need to be copy-read (TRANSFER_SRC) from the MSAA ones that only ever get rendered into.
+    void CreateColorImage(VkExtent2D extent, VkSampleCountFlagBits samples, VkImageUsageFlags usage,
+                          VkImage& img, VkDeviceMemory& mem, VkImageView& view);
+    // Destroys and nulls out an image created by CreateColorImage — a no-op if `img` is already
+    // VK_NULL_HANDLE. Callers own waiting for the GPU to be done with it first.
+    void DestroyColorImage(VkImage& img, VkDeviceMemory& mem, VkImageView& view);
 };

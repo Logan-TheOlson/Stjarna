@@ -1,12 +1,24 @@
 #include "util/Recorder.h"
 #include <algorithm>
+#include <chrono>
 #include <sstream>
 #include <thread>
+#ifndef _WIN32
+#include <csignal>
+#endif
 
 Recorder::~Recorder() { Stop(); }
 
 bool Recorder::Start(const std::string& outputPath, int width, int height, int fps, const char* pixelFormat) {
     Stop();
+
+#ifndef _WIN32
+    // Writing to the ffmpeg pipe after it exits (crashed, killed, or never execed because ffmpeg
+    // isn't on PATH) raises SIGPIPE, whose default disposition kills this whole process. Ignoring
+    // it makes the fwrite in WriterLoop fail with EPIPE instead, which the existing "drop rather
+    // than stall" queuing already tolerates.
+    signal(SIGPIPE, SIG_IGN);
+#endif
 
     // The sim's own thread pool (ParallelFor) already saturates every hardware thread every
     // substep. x264 defaults to using just as many threads for real-time encoding, so left
@@ -33,8 +45,9 @@ bool Recorder::Start(const std::string& outputPath, int width, int height, int f
         return false;
     }
 
-    stopping_ = false;
-    worker_   = std::thread(&Recorder::WriterLoop, this);
+    stopping_   = false;
+    workerDone_ = false;
+    worker_     = std::thread(&Recorder::WriterLoop, this);
     return true;
 }
 
@@ -54,7 +67,7 @@ void Recorder::WriterLoop() {
         {
             std::unique_lock<std::mutex> lock(queueMutex_);
             queueCv_.wait(lock, [&] { return !queue_.empty() || stopping_; });
-            if (queue_.empty() && stopping_) return;
+            if (queue_.empty() && stopping_) break;
             job = std::move(queue_.front());
             queue_.pop_front();
         }
@@ -63,6 +76,10 @@ void Recorder::WriterLoop() {
         fwrite(job.data, 1, job.bytes, pipe_);
         job.release();
     }
+
+    std::lock_guard<std::mutex> lock(doneMutex_);
+    workerDone_ = true;
+    doneCv_.notify_all();
 }
 
 void Recorder::Stop() {
@@ -73,7 +90,28 @@ void Recorder::Stop() {
         stopping_ = true;
     }
     queueCv_.notify_all();
-    if (worker_.joinable()) worker_.join(); // drains whatever is still queued before we close the pipe
+
+    // Bound how long we wait for the worker to drain cleanly. A stalled ffmpeg (full disk,
+    // suspended process, stuck writing to a network filesystem) can leave it blocked inside
+    // fwrite() forever; every caller of Stop() (the Cancel button, the length-cap auto-stop, and
+    // ~Recorder() at process exit) runs on the main thread, so an unbounded join() here would
+    // freeze the whole app instead of just abandoning this one recording.
+    constexpr auto kDrainTimeout = std::chrono::seconds(5);
+    bool drained;
+    {
+        std::unique_lock<std::mutex> lock(doneMutex_);
+        drained = doneCv_.wait_for(lock, kDrainTimeout, [&] { return workerDone_; });
+    }
+
+    if (!drained) {
+        fprintf(stderr, "Recorder: ffmpeg pipe stalled, abandoning writer thread\n");
+        worker_.detach(); // still owns pipe_; leaked rather than closed out from under it
+        pipe_ = nullptr;
+        queue_.clear();
+        return;
+    }
+
+    if (worker_.joinable()) worker_.join(); // known to have already returned, so this is immediate
 
 #ifdef _WIN32
     _pclose(pipe_);

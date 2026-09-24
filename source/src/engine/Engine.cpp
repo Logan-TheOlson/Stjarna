@@ -2,6 +2,7 @@
 #include "engine/Scene.h"
 #include "renderer/App.h"
 #include "util/DataRecorder.h"
+#include "util/Filename.h"
 #include "util/Profiler.h"
 #include "Config.h"
 #include <imgui.h>
@@ -124,7 +125,7 @@ struct MenuConfig {
     // instead of pacing to real time, so the video finishes in however long that takes to compute
     // rather than lengthSeconds of real time — see AdvanceRendering.
     bool  batchRender = false;
-    int   sceneIndex = 2; // TEMP: testing Self-Gravity at 25k, revert to 0 before commit
+    int   sceneIndex = 0;
 
     // Particle grid override, applied via BuildScene() instead of the selected preset's own
     // count — synced from the preset's default whenever sceneIndex changes (see DrawMenu), so
@@ -153,15 +154,6 @@ static float        dataElapsed{ 0.f };       // sim seconds since this data sav
 static uint32_t     dataSavedFrames{ 0 };
 static int          dataRateActive{ 0 };
 static float        dataLengthActive{ 0.f };  // 0 = unlimited, mirrors menuConfig.lengthSeconds for video
-
-// Strips anything unsafe as a filename (mirrors App::StartRecording's title sanitizing).
-static std::string SanitizeFilename(const char* raw, const char* fallback) {
-    std::string safe;
-    for (const char* c = raw; *c; c++)
-        safe += (std::isalnum((unsigned char)*c) || *c == '-' || *c == '_' || *c == ' ') ? *c : '_';
-    if (safe.empty()) safe = fallback;
-    return safe;
-}
 
 // Identifies which Start-Simulation/Restart session a KESample belongs to (see WriteKineticEnergyCsv).
 static int runIndex = -1;
@@ -331,18 +323,44 @@ static void ReturnToMenu() {
 }
 
 static void DrawMenu() {
+    // Every free-text row below (TextDisabled/TextUnformatted, including this scene's own
+    // varying-length description) wraps at the same fixed width every stretchy input/button also
+    // uses — computed as whichever Checkbox label in this window is actually the widest, since a
+    // Checkbox can't wrap. Sizing everything else to match that (rather than a guessed constant,
+    // which was narrower than "Render as fast as possible (no live playback)") is what stops the
+    // width-260 rows from sitting stuck against the left edge with dead space to their right once
+    // that wider Checkbox forces the window itself wider.
+    auto CheckboxWidth = [](const char* label) {
+        return ImGui::GetFrameHeight() + ImGui::GetStyle().ItemInnerSpacing.x + ImGui::CalcTextSize(label).x;
+    };
+    const float MenuContentWidth = std::max({
+        260.f,
+        CheckboxWidth("Record to video"),
+        CheckboxWidth("Render as fast as possible (no live playback)"),
+        CheckboxWidth("Circular spawn"),
+        CheckboxWidth("Save data to CSV"),
+    });
+    // Width for an input whose own trailing label (e.g. InputInt's "Grid X") renders past the
+    // box — reserves that label's space out of MenuContentWidth so box+label together land
+    // exactly on the wrap boundary above instead of a few pixels past it, which otherwise wraps
+    // the label onto its own line (PushTextWrapPos affects every Text-family draw, including a
+    // widget's own trailing label).
+    auto LabeledItemWidth = [&](const char* label) {
+        return MenuContentWidth - ImGui::CalcTextSize(label).x - ImGui::GetStyle().ItemInnerSpacing.x;
+    };
+
     const ImGuiIO& io = ImGui::GetIO();
     ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f, io.DisplaySize.y * 0.5f), ImGuiCond_Always, ImVec2(0.5f, 0.5f));
     ImGui::SetNextWindowBgAlpha(0.9f);
     ImGui::Begin("Stjarna", nullptr, ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoCollapse);
+    ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + MenuContentWidth);
 
     ImGui::TextUnformatted("SPH Fluid Simulation");
     ImGui::Separator();
 
     ImGui::TextUnformatted("Scene");
-    ImGui::SetNextItemWidth(-FLT_MIN);
-    const Scene& selectedScene = ScenePresets[menuConfig.sceneIndex];
-    if (ImGui::BeginCombo("##scene", selectedScene.name)) {
+    ImGui::SetNextItemWidth(MenuContentWidth);
+    if (ImGui::BeginCombo("##scene", ScenePresets[menuConfig.sceneIndex].name)) {
         for (int i = 0; i < static_cast<int>(ScenePresets.size()); i++) {
             const bool isSelected = (i == menuConfig.sceneIndex);
             if (ImGui::Selectable(ScenePresets[i].name, isSelected))
@@ -351,7 +369,12 @@ static void DrawMenu() {
         }
         ImGui::EndCombo();
     }
-    ImGui::TextWrapped("%s", selectedScene.description);
+    // Bound only after the combo above has had a chance to change sceneIndex this same frame —
+    // a reference bound before that point would keep aliasing the *previous* selection for the
+    // rest of this function (references don't rebind when the index changes later), which used
+    // to make the grid-count reset below copy the old scene's spawn instead of the new one.
+    const Scene& selectedScene = ScenePresets[menuConfig.sceneIndex];
+    ImGui::TextUnformatted(selectedScene.description);
 
     // Reset to the newly-selected preset's own count on every scene change (including the very
     // first DrawMenu call, since lastSyncedSceneIndex starts at a value no real sceneIndex can
@@ -366,27 +389,26 @@ static void DrawMenu() {
 
     ImGui::Separator();
     ImGui::TextUnformatted("Particles");
+    ImGui::SetNextItemWidth(LabeledItemWidth("Grid X"));
     ImGui::InputInt("Grid X", &menuConfig.gridCountX);
+    ImGui::SetNextItemWidth(LabeledItemWidth("Grid Y"));
     ImGui::InputInt("Grid Y", &menuConfig.gridCountY);
     menuConfig.gridCountX = std::max(menuConfig.gridCountX, 1);
     menuConfig.gridCountY = std::max(menuConfig.gridCountY, 1);
-    ImGui::Checkbox("Circular spawn (disk instead of a grid block)", &menuConfig.circularSpawn);
-    ImGui::TextDisabled("%d particles (grid X * grid Y%s)", menuConfig.gridCountX * menuConfig.gridCountY,
-                         menuConfig.circularSpawn ? ", packed into a disk" : "");
-    if (menuConfig.gridCountX * menuConfig.gridCountY > selectedScene.spawn.gridCountX * selectedScene.spawn.gridCountY * 4)
-        ImGui::TextColored(ImVec4(1.f, 0.7f, 0.2f, 1.f),
-                            "Well above this scene's tuned count — may be slow or unstable.");
-    if (menuConfig.circularSpawn != selectedScene.spawn.circular)
-        ImGui::TextColored(ImVec4(1.f, 0.7f, 0.2f, 1.f),
-                            "Differs from this scene's own spawn shape — any calibration tuned for "
-                            "the original shape (e.g. Self-Gravity's Lane-Emden fit) may not hold.");
+    ImGui::Checkbox("Circular spawn", &menuConfig.circularSpawn);
+    ImGui::TextDisabled("%d particles", menuConfig.gridCountX * menuConfig.gridCountY);
+    ImGui::TextDisabled("Real-Time Limit: %d particles",
+                         selectedScene.realTimeLimitX * selectedScene.realTimeLimitY);
 
     ImGui::Separator();
     ImGui::Checkbox("Record to video", &menuConfig.record);
     if (menuConfig.record) {
+        ImGui::SetNextItemWidth(LabeledItemWidth("Title"));
         ImGui::InputText("Title", menuConfig.title, sizeof(menuConfig.title));
+        ImGui::SetNextItemWidth(LabeledItemWidth("FPS"));
         ImGui::InputInt("FPS", &menuConfig.fps);
         menuConfig.fps = std::clamp(menuConfig.fps, 1, 240);
+        ImGui::SetNextItemWidth(LabeledItemWidth("Length (s, 0 = unlimited)"));
         ImGui::InputFloat("Length (s, 0 = unlimited)", &menuConfig.lengthSeconds, 1.0f, 10.0f, "%.0f");
         menuConfig.lengthSeconds = std::max(menuConfig.lengthSeconds, 0.f);
         ImGui::TextDisabled("Saved to recordings/<title>.mp4 (requires ffmpeg on PATH)");
@@ -400,17 +422,19 @@ static void DrawMenu() {
         // Batch-rendered video never visits Running's live "Controls" panel, so without this a
         // batch render could only ever use the scene's plain color — set it here instead, before
         // the video starts. Applies to a live recording too, just redundant with the panel there.
-        // 260px to match the "Start Simulation" button below (the window auto-sizes to content).
         ImGui::Spacing();
-        DrawColorByControls(260.f);
+        DrawColorByControls(MenuContentWidth);
     }
 
     ImGui::Separator();
     ImGui::Checkbox("Save data to CSV", &menuConfig.saveData);
     if (menuConfig.saveData) {
+        ImGui::SetNextItemWidth(LabeledItemWidth("Data title"));
         ImGui::InputText("Data title", menuConfig.dataTitle, sizeof(menuConfig.dataTitle));
+        ImGui::SetNextItemWidth(LabeledItemWidth("Sample rate (Hz)"));
         ImGui::InputInt("Sample rate (Hz)", &menuConfig.dataRate);
         menuConfig.dataRate = std::clamp(menuConfig.dataRate, 1, 240);
+        ImGui::SetNextItemWidth(LabeledItemWidth("Save length (s, 0 = unlimited)"));
         ImGui::InputFloat("Save length (s, 0 = unlimited)", &menuConfig.dataLengthSeconds, 1.0f, 10.0f, "%.0f");
         menuConfig.dataLengthSeconds = std::max(menuConfig.dataLengthSeconds, 0.f);
 
@@ -428,9 +452,10 @@ static void DrawMenu() {
     }
 
     ImGui::Separator();
-    if (ImGui::Button("Start Simulation", ImVec2(260.f, 0.f)))
+    if (ImGui::Button("Start Simulation", ImVec2(MenuContentWidth, 0.f)))
         StartSimulationFromMenu();
 
+    ImGui::PopTextWrapPos();
     ImGui::End();
 }
 
@@ -526,9 +551,11 @@ void RemoveObject(size_t i) {
 }
 
 // The simulation container's half-extents — the active scene's boundary fractions applied to the
-// actual window size, so a scene can request walls closer in than the window edge.
-float ScreenHalfWidth()  { return app.HalfWidth()  * ActiveScene.boundary.widthFrac; }
-float ScreenHalfHeight() { return app.HalfHeight() * ActiveScene.boundary.heightFrac; }
+// recording's own resolution while one is active (so the boundary/wall-bounce geometry can't
+// drift out from under a captured video frame that's pinned to a fixed size — see
+// VulkanContext::RecordingHalfWidth/Height), or the live window size otherwise.
+float ScreenHalfWidth()  { return app.RecordingHalfWidth()  * ActiveScene.boundary.widthFrac; }
+float ScreenHalfHeight() { return app.RecordingHalfHeight() * ActiveScene.boundary.heightFrac; }
 
 // Draws a black frame at the active scene's boundary, so a container narrower than the window
 // (see SceneBoundary) reads as a wall instead of an invisible line partway across the screen.
