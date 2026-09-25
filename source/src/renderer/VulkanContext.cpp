@@ -125,8 +125,26 @@ bool VulkanContext::Init(SDL_Window* window) {
     };
     chk(vkCreateDescriptorSetLayout(device, &dslCI, nullptr, &shapeDescSetLayout));
 
-    CreateShapePipeline("circle.vert.spv", "circle.frag.spv", shapeDescSetLayout, circlePipelineLayout, circlePipeline);
-    CreateShapePipeline("rect.vert.spv", "rect.frag.spv", shapeDescSetLayout, rectPipelineLayout, rectPipeline);
+    // Circles accumulate additively (premultiplied color + coverage) into the float density buffer
+    // — see kDensityFormat's comment — instead of compositing straight onto the final image.
+    VkPipelineColorBlendAttachmentState circleBlend{
+        .blendEnable = VK_TRUE,
+        .srcColorBlendFactor = VK_BLEND_FACTOR_ONE, .dstColorBlendFactor = VK_BLEND_FACTOR_ONE, .colorBlendOp = VK_BLEND_OP_ADD,
+        .srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE, .dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE, .alphaBlendOp = VK_BLEND_OP_ADD,
+        .colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT,
+    };
+    CreateShapePipeline("circle.vert.spv", "circle.frag.spv", shapeDescSetLayout, kDensityFormat, sceneSampleCount, circleBlend, circlePipelineLayout, circlePipeline);
+    // Rects (boundary outline) draw normally, straight alpha-over onto the final single-sample
+    // image, in the composite pass — they're thin shader-antialiased lines (see rect.frag), not
+    // dense point geometry, so they don't need the density-buffer treatment or MSAA.
+    VkPipelineColorBlendAttachmentState rectBlend{
+        .blendEnable = VK_TRUE,
+        .srcColorBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA, .dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA, .colorBlendOp = VK_BLEND_OP_ADD,
+        .srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE,       .dstAlphaBlendFactor = VK_BLEND_FACTOR_ZERO,               .alphaBlendOp = VK_BLEND_OP_ADD,
+        .colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT,
+    };
+    CreateShapePipeline("rect.vert.spv", "rect.frag.spv", shapeDescSetLayout, imageFormat, VK_SAMPLE_COUNT_1_BIT, rectBlend, rectPipelineLayout, rectPipeline);
+    CreateCompositePipeline();
 
     // SSBOs â€” persistently mapped, host-visible + coherent
     const VkDeviceSize circleSSBOSize = kMaxObjects * sizeof(CircleData);
@@ -136,12 +154,16 @@ bool VulkanContext::Init(SDL_Window* window) {
     CreateSSBO(rectSSBOSize, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
                rectSSBO, rectSSBOMemory, rectMapped);
 
-    // Descriptor pool + sets — one storage-buffer descriptor set each for circles and rects,
-    // sharing shapeDescSetLayout since both are just "one SSBO at binding 0".
-    VkDescriptorPoolSize poolSize{ .type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 2 };
+    // Descriptor pool + sets — one storage-buffer descriptor set each for circles and rects, plus
+    // one combined-image-sampler descriptor set each for the swapchain and offscreen composite
+    // passes (see compositeDescSetLayout's comment).
+    VkDescriptorPoolSize poolSizes[2]{
+        { .type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 2 },
+        { .type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .descriptorCount = 2 },
+    };
     VkDescriptorPoolCreateInfo poolCI{
         .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
-        .maxSets = 2, .poolSizeCount = 1, .pPoolSizes = &poolSize,
+        .maxSets = 4, .poolSizeCount = 2, .pPoolSizes = poolSizes,
     };
     chk(vkCreateDescriptorPool(device, &poolCI, nullptr, &descPool));
 
@@ -159,6 +181,16 @@ bool VulkanContext::Init(SDL_Window* window) {
         { .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = rectDescSet,   .dstBinding = 0, .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .pBufferInfo = &rectBI },
     };
     vkUpdateDescriptorSets(device, 2, writes, 0, nullptr);
+
+    VkDescriptorSetAllocateInfo compositeAllocInfo{
+        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+        .descriptorPool = descPool, .descriptorSetCount = 1, .pSetLayouts = &compositeDescSetLayout,
+    };
+    chk(vkAllocateDescriptorSets(device, &compositeAllocInfo, &swapchainCompositeDescSet));
+    chk(vkAllocateDescriptorSets(device, &compositeAllocInfo, &offscreenCompositeDescSet));
+    // CreateSwapchain() ran earlier in Init(), before compositeDescSetLayout/swapchainCompositeDescSet
+    // existed, and skipped this write — do the equivalent one now that densityView is already valid.
+    UpdateCompositeDescSet(swapchainCompositeDescSet, densityView);
 
     VkCommandPoolCreateInfo cpCI{ .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO, .flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT, .queueFamilyIndex = queueFamily };
     chk(vkCreateCommandPool(device, &cpCI, nullptr, &commandPool));
@@ -344,10 +376,18 @@ void VulkanContext::CreateSwapchain() {
 
     // Sized to swapchainExtent, so it must be rebuilt every time that changes too — the caller
     // (Init()/RecreateSwapchain()) has already made sure the GPU is idle before we get here.
-    DestroyColorImage(swapchainMsaaImage, swapchainMsaaMemory, swapchainMsaaView);
+    DestroyColorImage(densityMsaaImage, densityMsaaMemory, densityMsaaView);
+    DestroyColorImage(densityImage, densityMemory, densityView);
     if (sceneSampleCount != VK_SAMPLE_COUNT_1_BIT)
         CreateColorImage(swapchainExtent, sceneSampleCount, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT,
-                         swapchainMsaaImage, swapchainMsaaMemory, swapchainMsaaView);
+                         densityMsaaImage, densityMsaaMemory, densityMsaaView, kDensityFormat);
+    CreateColorImage(swapchainExtent, VK_SAMPLE_COUNT_1_BIT,
+                     VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+                     densityImage, densityMemory, densityView, kDensityFormat);
+    // The composite pipeline/descriptor set aren't created yet the very first time CreateSwapchain()
+    // runs (Init() calls it before CreateCompositePipeline()) — skip the update then, Init() does an
+    // equivalent one right after creating the descriptor set instead.
+    if (swapchainCompositeDescSet != VK_NULL_HANDLE) UpdateCompositeDescSet(swapchainCompositeDescSet, densityView);
 }
 
 void VulkanContext::RecreateSwapchain() {
@@ -361,11 +401,11 @@ void VulkanContext::RecreateSwapchain() {
     CreateSwapchain();
 }
 
-// Shared by RenderFrame() and RenderOffscreenFrame(): draws the current circles/rects into
-// `drawView` at `extent` (resolving into `resolveView` if it's not VK_NULL_HANDLE — see the header
-// comment) and clears both vectors. Must run between vkCmdBeginCommandBuffer and the caller's own
-// barriers/vkCmdEndCommandBuffer.
-void VulkanContext::RecordScenePass(VkImageView drawView, VkImageView resolveView, VkExtent2D extent) {
+// Pass 1 (see header comment): draws the current circles into `drawView` at `extent` (resolving
+// into `resolveView` if it's not VK_NULL_HANDLE), additively accumulating density, and clears the
+// circles vector. Must run between vkCmdBeginCommandBuffer and the caller's own barriers/
+// vkCmdEndCommandBuffer.
+void VulkanContext::RecordDensityPass(VkImageView drawView, VkImageView resolveView, VkExtent2D extent) {
     const bool msaa = resolveView != VK_NULL_HANDLE;
     VkRenderingAttachmentInfo att{
         .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
@@ -377,6 +417,42 @@ void VulkanContext::RecordScenePass(VkImageView drawView, VkImageView resolveVie
         // The MSAA attachment itself is transient — only the resolved output (resolveView) is ever
         // read again — so DONT_CARE saves the driver from actually writing it back to memory.
         .storeOp = msaa ? VK_ATTACHMENT_STORE_OP_DONT_CARE : VK_ATTACHMENT_STORE_OP_STORE,
+        .clearValue = { .color = { .float32 = { 0.0f, 0.0f, 0.0f, 0.0f } } }, // transparent — no density yet
+    };
+    VkRenderingInfo ri{
+        .sType = VK_STRUCTURE_TYPE_RENDERING_INFO,
+        .renderArea = { {0,0}, extent },
+        .layerCount = 1, .colorAttachmentCount = 1, .pColorAttachments = &att,
+    };
+    vkCmdBeginRendering(cb, &ri);
+    {
+        VkViewport viewport{ 0, 0, (float)extent.width, (float)extent.height, 0.0f, 1.0f };
+        VkRect2D   scissor{ {0,0}, extent };
+        vkCmdSetViewport(cb, 0, 1, &viewport);
+        vkCmdSetScissor(cb, 0, 1, &scissor);
+
+        if (!circles.empty()) {
+            float invScreen[2] = { 2.0f / extent.width, 2.0f / extent.height };
+            const uint32_t n = (uint32_t)circles.size();
+            memcpy(circleMapped, circles.data(), n * sizeof(CircleData));
+            vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, circlePipeline);
+            vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, circlePipelineLayout, 0, 1, &circleDescSet, 0, nullptr);
+            vkCmdPushConstants(cb, circlePipelineLayout, VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(invScreen), invScreen);
+            vkCmdDraw(cb, 6, n, 0, 0);
+        }
+    }
+    vkCmdEndRendering(cb);
+    circles.clear();
+}
+
+// Pass 2 (see header comment): unpremultiplies the density buffer `compositeSet` is bound to into
+// real color, drawn into `finalView` under the current rects, and clears the rects vector. Same
+// barrier contract as RecordDensityPass.
+void VulkanContext::RecordCompositePass(VkDescriptorSet compositeSet, VkImageView finalView, VkExtent2D extent) {
+    VkRenderingAttachmentInfo att{
+        .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
+        .imageView = finalView, .imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+        .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR, .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
         .clearValue = { .color = { .float32 = { 0.169f, 0.204f, 0.267f, 1.0f } } }, // #2b3444
     };
     VkRenderingInfo ri{
@@ -391,18 +467,12 @@ void VulkanContext::RecordScenePass(VkImageView drawView, VkImageView resolveVie
         vkCmdSetViewport(cb, 0, 1, &viewport);
         vkCmdSetScissor(cb, 0, 1, &scissor);
 
-        float invScreen[2] = { 2.0f / extent.width, 2.0f / extent.height };
-
-        if (!circles.empty()) {
-            const uint32_t n = (uint32_t)circles.size();
-            memcpy(circleMapped, circles.data(), n * sizeof(CircleData));
-            vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, circlePipeline);
-            vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, circlePipelineLayout, 0, 1, &circleDescSet, 0, nullptr);
-            vkCmdPushConstants(cb, circlePipelineLayout, VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(invScreen), invScreen);
-            vkCmdDraw(cb, 6, n, 0, 0);
-        }
+        vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, compositePipeline);
+        vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, compositePipelineLayout, 0, 1, &compositeSet, 0, nullptr);
+        vkCmdDraw(cb, 3, 1, 0, 0); // fullscreen triangle, positions computed from gl_VertexIndex
 
         if (!rects.empty()) {
+            float invScreen[2] = { 2.0f / extent.width, 2.0f / extent.height };
             const uint32_t n = (uint32_t)rects.size();
             memcpy(rectMapped, rects.data(), n * sizeof(RectData));
             vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, rectPipeline);
@@ -412,7 +482,6 @@ void VulkanContext::RecordScenePass(VkImageView drawView, VkImageView resolveVie
         }
     }
     vkCmdEndRendering(cb);
-    circles.clear();
     rects.clear();
 }
 
@@ -425,7 +494,11 @@ void VulkanContext::EnsureOffscreenTarget(uint32_t w, uint32_t h) {
                      offscreenImage, offscreenMemory, offscreenView);
     if (sceneSampleCount != VK_SAMPLE_COUNT_1_BIT)
         CreateColorImage({ w, h }, sceneSampleCount, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT,
-                         offscreenMsaaImage, offscreenMsaaMemory, offscreenMsaaView);
+                         offscreenDensityMsaaImage, offscreenDensityMsaaMemory, offscreenDensityMsaaView, kDensityFormat);
+    CreateColorImage({ w, h }, VK_SAMPLE_COUNT_1_BIT,
+                     VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+                     offscreenDensityImage, offscreenDensityMemory, offscreenDensityView, kDensityFormat);
+    UpdateCompositeDescSet(offscreenCompositeDescSet, offscreenDensityView);
 
     offscreenExtent = { w, h };
     offscreenEverRendered = false;
@@ -435,15 +508,17 @@ void VulkanContext::DestroyOffscreenTarget() {
     if (offscreenImage == VK_NULL_HANDLE) return;
     vkDeviceWaitIdle(device);
     DestroyColorImage(offscreenImage, offscreenMemory, offscreenView);
-    DestroyColorImage(offscreenMsaaImage, offscreenMsaaMemory, offscreenMsaaView);
+    DestroyColorImage(offscreenDensityMsaaImage, offscreenDensityMsaaMemory, offscreenDensityMsaaView);
+    DestroyColorImage(offscreenDensityImage, offscreenDensityMemory, offscreenDensityView);
     offscreenExtent = {};
 }
 
 void VulkanContext::CreateColorImage(VkExtent2D extent, VkSampleCountFlagBits samples, VkImageUsageFlags usage,
-                                     VkImage& img, VkDeviceMemory& mem, VkImageView& view) {
+                                     VkImage& img, VkDeviceMemory& mem, VkImageView& view, VkFormat format) {
+    if (format == VK_FORMAT_UNDEFINED) format = imageFormat;
     VkImageCreateInfo imgCI{
         .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
-        .imageType = VK_IMAGE_TYPE_2D, .format = imageFormat,
+        .imageType = VK_IMAGE_TYPE_2D, .format = format,
         .extent = { extent.width, extent.height, 1 }, .mipLevels = 1, .arrayLayers = 1,
         .samples = samples, .tiling = VK_IMAGE_TILING_OPTIMAL,
         .usage = usage, .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
@@ -473,7 +548,7 @@ void VulkanContext::CreateColorImage(VkExtent2D extent, VkSampleCountFlagBits sa
 
     VkImageViewCreateInfo ivCI{
         .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .image = img,
-        .viewType = VK_IMAGE_VIEW_TYPE_2D, .format = imageFormat,
+        .viewType = VK_IMAGE_VIEW_TYPE_2D, .format = format,
         .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 },
     };
     chk(vkCreateImageView(device, &ivCI, nullptr, &view));
@@ -488,7 +563,8 @@ void VulkanContext::DestroyColorImage(VkImage& img, VkDeviceMemory& mem, VkImage
 }
 
 void VulkanContext::CreateShapePipeline(const char* vertSpv, const char* fragSpv,
-                                        VkDescriptorSetLayout descSetLayout,
+                                        VkDescriptorSetLayout descSetLayout, VkFormat colorFormat,
+                                        VkSampleCountFlagBits sampleCount, const VkPipelineColorBlendAttachmentState& blendAtt,
                                         VkPipelineLayout& outLayout, VkPipeline& outPipeline) {
     VkShaderModule vertMod = MakeShader(device, LoadSpv(vertSpv));
     VkShaderModule fragMod = MakeShader(device, LoadSpv(fragSpv));
@@ -501,17 +577,10 @@ void VulkanContext::CreateShapePipeline(const char* vertSpv, const char* fragSpv
     VkPipelineInputAssemblyStateCreateInfo inputAssembly{ .sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO, .topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST };
     VkPipelineViewportStateCreateInfo      viewportState{ .sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO, .viewportCount = 1, .scissorCount = 1 };
     VkPipelineRasterizationStateCreateInfo rasterizer   { .sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO, .polygonMode = VK_POLYGON_MODE_FILL, .cullMode = VK_CULL_MODE_NONE, .lineWidth = 1.0f };
-    // Must match whatever sample count the scene pass is actually rendering at (see
-    // VulkanContext.h's sceneSampleCount comment) — dynamic rendering has no render-pass object to
-    // cross-check this against, so a mismatch here wouldn't fail to compile or even necessarily
-    // validate cleanly, just render wrong.
-    VkPipelineMultisampleStateCreateInfo   multisample  { .sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO, .rasterizationSamples = sceneSampleCount };
-    VkPipelineColorBlendAttachmentState blendAtt{
-        .blendEnable = VK_TRUE,
-        .srcColorBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA, .dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA, .colorBlendOp = VK_BLEND_OP_ADD,
-        .srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE,       .dstAlphaBlendFactor = VK_BLEND_FACTOR_ZERO,               .alphaBlendOp = VK_BLEND_OP_ADD,
-        .colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT,
-    };
+    // Must match whatever sample count this pipeline's target is actually rendered at — dynamic
+    // rendering has no render-pass object to cross-check this against, so a mismatch here wouldn't
+    // fail to compile or even necessarily validate cleanly, just render wrong.
+    VkPipelineMultisampleStateCreateInfo   multisample  { .sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO, .rasterizationSamples = sampleCount };
     VkPipelineColorBlendStateCreateInfo colorBlend  { .sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO, .attachmentCount = 1, .pAttachments = &blendAtt };
     VkDynamicState dynStates[]{ VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR };
     VkPipelineDynamicStateCreateInfo    dynamicState{ .sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO, .dynamicStateCount = 2, .pDynamicStates = dynStates };
@@ -524,7 +593,7 @@ void VulkanContext::CreateShapePipeline(const char* vertSpv, const char* fragSpv
     };
     chk(vkCreatePipelineLayout(device, &layoutCI, nullptr, &outLayout));
 
-    VkPipelineRenderingCreateInfo renderingCI{ .sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO, .colorAttachmentCount = 1, .pColorAttachmentFormats = &imageFormat };
+    VkPipelineRenderingCreateInfo renderingCI{ .sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO, .colorAttachmentCount = 1, .pColorAttachmentFormats = &colorFormat };
     VkGraphicsPipelineCreateInfo pipelineCI{
         .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, .pNext = &renderingCI,
         .stageCount = 2, .pStages = stages,
@@ -537,6 +606,80 @@ void VulkanContext::CreateShapePipeline(const char* vertSpv, const char* fragSpv
 
     vkDestroyShaderModule(device, vertMod, nullptr);
     vkDestroyShaderModule(device, fragMod, nullptr);
+}
+
+// Composite pipeline: a fullscreen triangle (no vertex buffer — positions come from gl_VertexIndex,
+// see resolve.vert) that samples the density buffer and unpremultiplies it into final color (see
+// resolve.frag and kDensityFormat's comment), blended normally over the already-cleared background.
+void VulkanContext::CreateCompositePipeline() {
+    VkDescriptorSetLayoutBinding samplerBinding{
+        .binding = 0, .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+        .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT,
+    };
+    VkDescriptorSetLayoutCreateInfo dslCI{
+        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+        .bindingCount = 1, .pBindings = &samplerBinding,
+    };
+    chk(vkCreateDescriptorSetLayout(device, &dslCI, nullptr, &compositeDescSetLayout));
+
+    VkSamplerCreateInfo samplerCI{
+        .sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,
+        .magFilter = VK_FILTER_NEAREST, .minFilter = VK_FILTER_NEAREST,
+        .addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+        .addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+        .addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+    };
+    chk(vkCreateSampler(device, &samplerCI, nullptr, &densitySampler));
+
+    VkShaderModule vertMod = MakeShader(device, LoadSpv("resolve.vert.spv"));
+    VkShaderModule fragMod = MakeShader(device, LoadSpv("resolve.frag.spv"));
+    VkPipelineShaderStageCreateInfo stages[2]{
+        { .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_VERTEX_BIT,   .module = vertMod, .pName = "main" },
+        { .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_FRAGMENT_BIT, .module = fragMod, .pName = "main" },
+    };
+    VkPipelineVertexInputStateCreateInfo   vertexInput  { .sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO };
+    VkPipelineInputAssemblyStateCreateInfo inputAssembly{ .sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO, .topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST };
+    VkPipelineViewportStateCreateInfo      viewportState{ .sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO, .viewportCount = 1, .scissorCount = 1 };
+    VkPipelineRasterizationStateCreateInfo rasterizer   { .sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO, .polygonMode = VK_POLYGON_MODE_FILL, .cullMode = VK_CULL_MODE_NONE, .lineWidth = 1.0f };
+    VkPipelineMultisampleStateCreateInfo   multisample  { .sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO, .rasterizationSamples = VK_SAMPLE_COUNT_1_BIT };
+    VkPipelineColorBlendAttachmentState blendAtt{
+        .blendEnable = VK_TRUE,
+        .srcColorBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA, .dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA, .colorBlendOp = VK_BLEND_OP_ADD,
+        .srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE,       .dstAlphaBlendFactor = VK_BLEND_FACTOR_ZERO,               .alphaBlendOp = VK_BLEND_OP_ADD,
+        .colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT,
+    };
+    VkPipelineColorBlendStateCreateInfo colorBlend{ .sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO, .attachmentCount = 1, .pAttachments = &blendAtt };
+    VkDynamicState dynStates[]{ VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR };
+    VkPipelineDynamicStateCreateInfo    dynamicState{ .sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO, .dynamicStateCount = 2, .pDynamicStates = dynStates };
+
+    VkPipelineLayoutCreateInfo layoutCI{
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+        .setLayoutCount = 1, .pSetLayouts = &compositeDescSetLayout,
+    };
+    chk(vkCreatePipelineLayout(device, &layoutCI, nullptr, &compositePipelineLayout));
+
+    VkPipelineRenderingCreateInfo renderingCI{ .sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO, .colorAttachmentCount = 1, .pColorAttachmentFormats = &imageFormat };
+    VkGraphicsPipelineCreateInfo pipelineCI{
+        .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, .pNext = &renderingCI,
+        .stageCount = 2, .pStages = stages,
+        .pVertexInputState = &vertexInput, .pInputAssemblyState = &inputAssembly,
+        .pViewportState = &viewportState,  .pRasterizationState = &rasterizer,
+        .pMultisampleState = &multisample, .pColorBlendState = &colorBlend,
+        .pDynamicState = &dynamicState,    .layout = compositePipelineLayout,
+    };
+    chk(vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1, &pipelineCI, nullptr, &compositePipeline));
+
+    vkDestroyShaderModule(device, vertMod, nullptr);
+    vkDestroyShaderModule(device, fragMod, nullptr);
+}
+
+void VulkanContext::UpdateCompositeDescSet(VkDescriptorSet set, VkImageView view) {
+    VkDescriptorImageInfo imgInfo{ .sampler = densitySampler, .imageView = view, .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
+    VkWriteDescriptorSet write{
+        .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = set, .dstBinding = 0,
+        .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .pImageInfo = &imgInfo,
+    };
+    vkUpdateDescriptorSets(device, 1, &write, 0, nullptr);
 }
 
 void VulkanContext::CreateSSBO(VkDeviceSize size, VkBufferUsageFlags usage, VkMemoryPropertyFlags preferred,
@@ -755,7 +898,8 @@ void VulkanContext::RenderFrame(float dt) {
     };
     vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0, 0, nullptr, 0, nullptr, 1, &toRender);
 
-    // The MSAA target's contents never need to survive between frames (see RecordScenePass), so
+    // Neither density target's contents ever need to survive between frames (see RecordDensityPass
+    // — both are fully overwritten, one by CLEAR+draw, the resolve target by the resolve itself), so
     // there's nothing to preserve across this transition — always coming from UNDEFINED is simplest
     // and correct whether this is the image's first use or its hundredth.
     if (sceneSampleCount != VK_SAMPLE_COUNT_1_BIT) {
@@ -763,20 +907,36 @@ void VulkanContext::RenderFrame(float dt) {
             .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
             .srcAccessMask = 0, .dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
             .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED, .newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-            .image = swapchainMsaaImage, .subresourceRange = range,
+            .image = densityMsaaImage, .subresourceRange = range,
         };
         vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0, 0, nullptr, 0, nullptr, 1, &msaaToRender);
     }
+    VkImageMemoryBarrier densityToRender{
+        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+        .srcAccessMask = 0, .dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+        .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED, .newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+        .image = densityImage, .subresourceRange = range,
+    };
+    vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0, 0, nullptr, 0, nullptr, 1, &densityToRender);
 
-    // Pass 1: the simulated scene only (circles/rects). Ends and gets captured (if capturing)
-    // BEFORE ImGui ever draws, so a live-only overlay (the batch-render progress print used to be
-    // a progress bar here, and the profiler HUD below) can never contaminate the recorded video —
-    // see Engine.cpp's AdvanceRendering, which relies on exactly this. Resolves straight from
-    // swapchainMsaaImage into imageViews[imageIndex] (see RecordScenePass) when MSAA is active, so
-    // everything downstream of this call keeps reading imageViews[imageIndex] exactly as before.
-    RecordScenePass(sceneSampleCount != VK_SAMPLE_COUNT_1_BIT ? swapchainMsaaView : imageViews[imageIndex],
-                    sceneSampleCount != VK_SAMPLE_COUNT_1_BIT ? imageViews[imageIndex] : VK_NULL_HANDLE,
-                    swapchainExtent);
+    // Pass 1: accumulate circles into the density buffer, resolving into densityView. Pass 2 (below)
+    // unpremultiplies that into the simulated scene (circles + rects) and ends before ImGui ever
+    // draws, so a live-only overlay (the batch-render progress print used to be a progress bar here,
+    // and the profiler HUD below) can never contaminate the recorded video — see Engine.cpp's
+    // AdvanceRendering, which relies on exactly this.
+    RecordDensityPass(sceneSampleCount != VK_SAMPLE_COUNT_1_BIT ? densityMsaaView : densityView,
+                      sceneSampleCount != VK_SAMPLE_COUNT_1_BIT ? densityView : VK_NULL_HANDLE,
+                      swapchainExtent);
+
+    VkImageMemoryBarrier densityToShaderRead{
+        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+        .srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
+        .oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, .newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+        .image = densityImage, .subresourceRange = range,
+    };
+    vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, nullptr, 0, nullptr, 1, &densityToShaderRead);
+
+    RecordCompositePass(swapchainCompositeDescSet, imageViews[imageIndex], swapchainExtent);
 
     if (capturingThisFrame) {
         VkImageMemoryBarrier toTransferSrc{
@@ -892,21 +1052,38 @@ void VulkanContext::RenderOffscreenFrame() {
                           VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0, 0, nullptr, 0, nullptr, 1, &toRender);
     offscreenEverRendered = true;
 
-    // Same "always from UNDEFINED" reasoning as RenderFrame()'s swapchainMsaaImage barrier — this
-    // target is never read back either.
+    // Same "always from UNDEFINED" reasoning as RenderFrame()'s densityMsaaImage barrier — neither
+    // target is ever read back either.
     if (sceneSampleCount != VK_SAMPLE_COUNT_1_BIT) {
         VkImageMemoryBarrier msaaToRender{
             .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
             .srcAccessMask = 0, .dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
             .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED, .newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-            .image = offscreenMsaaImage, .subresourceRange = range,
+            .image = offscreenDensityMsaaImage, .subresourceRange = range,
         };
         vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0, 0, nullptr, 0, nullptr, 1, &msaaToRender);
     }
+    VkImageMemoryBarrier densityToRender{
+        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+        .srcAccessMask = 0, .dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+        .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED, .newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+        .image = offscreenDensityImage, .subresourceRange = range,
+    };
+    vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0, 0, nullptr, 0, nullptr, 1, &densityToRender);
 
-    RecordScenePass(sceneSampleCount != VK_SAMPLE_COUNT_1_BIT ? offscreenMsaaView : offscreenView,
-                    sceneSampleCount != VK_SAMPLE_COUNT_1_BIT ? offscreenView : VK_NULL_HANDLE,
-                    offscreenExtent);
+    RecordDensityPass(sceneSampleCount != VK_SAMPLE_COUNT_1_BIT ? offscreenDensityMsaaView : offscreenDensityView,
+                      sceneSampleCount != VK_SAMPLE_COUNT_1_BIT ? offscreenDensityView : VK_NULL_HANDLE,
+                      offscreenExtent);
+
+    VkImageMemoryBarrier densityToShaderRead{
+        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+        .srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
+        .oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, .newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+        .image = offscreenDensityImage, .subresourceRange = range,
+    };
+    vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, nullptr, 0, nullptr, 1, &densityToShaderRead);
+
+    RecordCompositePass(offscreenCompositeDescSet, offscreenView, offscreenExtent);
 
     VkImageMemoryBarrier toTransferSrc{
         .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
@@ -950,14 +1127,19 @@ void VulkanContext::Shutdown() {
     vkUnmapMemory(device, rectSSBOMemory);
     vkDestroyBuffer(device, rectSSBO, nullptr);
     vkFreeMemory(device, rectSSBOMemory, nullptr);
+    vkDestroyPipeline(device, compositePipeline, nullptr);
+    vkDestroyPipelineLayout(device, compositePipelineLayout, nullptr);
+    vkDestroySampler(device, densitySampler, nullptr);
     vkDestroyDescriptorPool(device, descPool, nullptr);
     vkDestroyDescriptorSetLayout(device, shapeDescSetLayout, nullptr);
+    vkDestroyDescriptorSetLayout(device, compositeDescSetLayout, nullptr);
     vkDestroyFence(device, fence, nullptr);
     vkDestroySemaphore(device, renderSem, nullptr);
     vkDestroySemaphore(device, acquireSem, nullptr);
     vkDestroyCommandPool(device, commandPool, nullptr);
     DestroyOffscreenTarget();
-    DestroyColorImage(swapchainMsaaImage, swapchainMsaaMemory, swapchainMsaaView);
+    DestroyColorImage(densityMsaaImage, densityMsaaMemory, densityMsaaView);
+    DestroyColorImage(densityImage, densityMemory, densityView);
     for (auto& iv : imageViews) vkDestroyImageView(device, iv, nullptr);
     vkDestroySwapchainKHR(device, swapchain, nullptr);
     vkDestroySurfaceKHR(instance, surface, nullptr);

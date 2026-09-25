@@ -49,9 +49,18 @@ add_custom_command(
     DEPENDS ${SHADER_DIR}/rect.vert ${SHADER_DIR}/rect.frag
     VERBATIM
 )
+add_custom_command(
+    OUTPUT  ${SHADER_OUT}/resolve.vert.spv ${SHADER_OUT}/resolve.frag.spv
+    COMMAND ${CMAKE_COMMAND} -E make_directory ${SHADER_OUT}
+    COMMAND ${GLSLC} ${SHADER_DIR}/resolve.vert -o ${SHADER_OUT}/resolve.vert.spv
+    COMMAND ${GLSLC} ${SHADER_DIR}/resolve.frag -o ${SHADER_OUT}/resolve.frag.spv
+    DEPENDS ${SHADER_DIR}/resolve.vert ${SHADER_DIR}/resolve.frag
+    VERBATIM
+)
 add_custom_target(Shaders DEPENDS
     ${SHADER_OUT}/circle.vert.spv ${SHADER_OUT}/circle.frag.spv
     ${SHADER_OUT}/rect.vert.spv ${SHADER_OUT}/rect.frag.spv
+    ${SHADER_OUT}/resolve.vert.spv ${SHADER_OUT}/resolve.frag.spv
 )
 
 # Karla ships with the fetched imgui source (misc/fonts) — copy it next to the exe so

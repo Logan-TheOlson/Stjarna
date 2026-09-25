@@ -103,7 +103,7 @@ private:
     VkColorSpaceKHR  colorSpace{ VK_COLORSPACE_SRGB_NONLINEAR_KHR };
     VkExtent2D       swapchainExtent{};
 
-    // Sample count the scene (circle/rect) pass renders at, chosen once in Init() from what the
+    // Sample count the density (circle) pass renders at, chosen once in Init() from what the
     // device actually supports (falls back to VK_SAMPLE_COUNT_1_BIT, i.e. no MSAA, if 4x isn't
     // available). This anti-aliases more than each shape's own edge (see circle.frag's smoothstep
     // rim, which already handled that) — at high particle counts, particles shrink to a couple of
@@ -112,21 +112,34 @@ private:
     // pixel aliases that regularity into a visible moiré "screen" pattern that per-shape edge AA
     // can't touch. Multisampling the whole pass softens that by sampling coverage several times
     // per pixel before resolving down to one color, the same fix a renderer would use for any
-    // dense, regular geometry — see swapchainMsaaImage/offscreenMsaaImage below.
+    // dense, regular geometry — see densityMsaaImage/offscreenDensityMsaaImage below.
     VkSampleCountFlagBits sceneSampleCount{ VK_SAMPLE_COUNT_1_BIT };
+
+    // Format of the density accumulation targets below — needs to hold sums well past 1.0 (many
+    // overlapping particles at a "high pressure" cluster), which an 8-bit UNORM swapchain format
+    // can't represent, hence a floating-point format distinct from imageFormat.
+    static constexpr VkFormat kDensityFormat = VK_FORMAT_R16G16B16A16_SFLOAT;
 
     VkSwapchainKHR         swapchain{ VK_NULL_HANDLE };
     std::vector<VkImage>   images;
     std::vector<VkImageView> imageViews;
 
-    // Multisampled color target the scene pass actually draws into when sceneSampleCount > 1,
-    // resolved into imageViews[imageIndex] as part of the same pass (see RecordScenePass) — never
-    // read from directly (no copy, no present), so its contents don't need to survive between
-    // frames; recreated alongside imageViews whenever CreateSwapchain() runs. Left at VK_NULL_HANDLE
-    // for the lifetime of the app if the device doesn't support sceneSampleCount's sample count.
-    VkImage        swapchainMsaaImage{ VK_NULL_HANDLE };
-    VkDeviceMemory swapchainMsaaMemory{ VK_NULL_HANDLE };
-    VkImageView    swapchainMsaaView{ VK_NULL_HANDLE };
+    // Circles no longer draw straight into the swapchain/offscreen target. Instead they accumulate
+    // additively (premultiplied color + coverage, see circle.frag) into this float density buffer —
+    // densityMsaaImage is the multisampled draw target (same anti-aliasing role sceneSampleCount's
+    // comment describes, just aimed at this buffer instead), resolved into densityImage, which is
+    // sampled back in the composite pass (see RecordCompositePass) to turn accumulated density into
+    // final color: unpremultiplying it recovers the density-weighted *average* color wherever
+    // several particles overlap, which is what makes dense clusters blend together instead of
+    // layering as discrete translucent disks. densityMsaaImage is left at VK_NULL_HANDLE for the
+    // lifetime of the app if the device doesn't support sceneSampleCount's sample count — density
+    // pass (RecordDensityPass) then draws directly into densityImage instead.
+    VkImage        densityMsaaImage{ VK_NULL_HANDLE };
+    VkDeviceMemory densityMsaaMemory{ VK_NULL_HANDLE };
+    VkImageView    densityMsaaView{ VK_NULL_HANDLE };
+    VkImage        densityImage{ VK_NULL_HANDLE };
+    VkDeviceMemory densityMemory{ VK_NULL_HANDLE };
+    VkImageView    densityView{ VK_NULL_HANDLE };
 
     // RenderOffscreenFrame()'s render target — same format as the swapchain, sized to match it at
     // StartRecording() time (see recordWidth_/recordHeight_) and recreated only if that changes.
@@ -134,11 +147,14 @@ private:
     VkDeviceMemory offscreenMemory{ VK_NULL_HANDLE };
     VkImageView    offscreenView{ VK_NULL_HANDLE };
     VkExtent2D     offscreenExtent{};
-    // offscreenImage's MSAA counterpart — same role/lifetime as swapchainMsaaImage above, just
-    // sized to/recreated alongside the offscreen target instead of the swapchain.
-    VkImage        offscreenMsaaImage{ VK_NULL_HANDLE };
-    VkDeviceMemory offscreenMsaaMemory{ VK_NULL_HANDLE };
-    VkImageView    offscreenMsaaView{ VK_NULL_HANDLE };
+    // offscreenImage's density counterparts — same role/lifetime as densityMsaaImage/densityImage
+    // above, just sized to/recreated alongside the offscreen target instead of the swapchain.
+    VkImage        offscreenDensityMsaaImage{ VK_NULL_HANDLE };
+    VkDeviceMemory offscreenDensityMsaaMemory{ VK_NULL_HANDLE };
+    VkImageView    offscreenDensityMsaaView{ VK_NULL_HANDLE };
+    VkImage        offscreenDensityImage{ VK_NULL_HANDLE };
+    VkDeviceMemory offscreenDensityMemory{ VK_NULL_HANDLE };
+    VkImageView    offscreenDensityView{ VK_NULL_HANDLE };
     // Whether offscreenImage has ever been rendered to — its very first barrier transitions from
     // UNDEFINED, every one after that from TRANSFER_SRC_OPTIMAL (where the previous frame's
     // capture copy left it).
@@ -157,6 +173,24 @@ private:
     VkDescriptorPool      descPool{ VK_NULL_HANDLE };
     VkDescriptorSet       circleDescSet{ VK_NULL_HANDLE };
     VkDescriptorSet       rectDescSet{ VK_NULL_HANDLE };
+
+    // Composite pass: samples densityView/offscreenDensityView (a single combined-image-sampler
+    // binding) and draws a fullscreen triangle that unpremultiplies the accumulated density into
+    // final color — see kDensityFormat's comment. Two descriptor sets because the swapchain and
+    // offscreen density images are sized independently and can be resolved to at different times
+    // (see RenderOffscreenFrame's comment on why both paths exist); each is re-pointed at its
+    // target's current VkImageView whenever that view is recreated (CreateSwapchain/
+    // EnsureOffscreenTarget), since a descriptor holds a specific view handle, not a "current view"
+    // indirection.
+    VkSampler              densitySampler{ VK_NULL_HANDLE };
+    VkDescriptorSetLayout  compositeDescSetLayout{ VK_NULL_HANDLE };
+    VkDescriptorSet        swapchainCompositeDescSet{ VK_NULL_HANDLE };
+    VkDescriptorSet        offscreenCompositeDescSet{ VK_NULL_HANDLE };
+    VkPipelineLayout       compositePipelineLayout{ VK_NULL_HANDLE };
+    VkPipeline             compositePipeline{ VK_NULL_HANDLE };
+    void CreateCompositePipeline();
+    // Writes `view` (must be in SHADER_READ_ONLY_OPTIMAL) into `set`'s binding 0.
+    void UpdateCompositeDescSet(VkDescriptorSet set, VkImageView view);
 
     VkBuffer       circleSSBO{ VK_NULL_HANDLE };
     VkDeviceMemory circleSSBOMemory{ VK_NULL_HANDLE };
@@ -218,20 +252,28 @@ private:
 
     void CreateSwapchain();
     void RecreateSwapchain();
-    // The circle/rect draw pass shared verbatim by RenderFrame() and RenderOffscreenFrame() —
-    // clears `drawView` and draws the current circles/rects into it at `extent`, then clears both
-    // vectors. Doesn't begin/end the command buffer or touch barriers; callers own those (including
-    // transitioning `drawView`'s image to COLOR_ATTACHMENT_OPTIMAL beforehand).
+    // Pass 1 of the scene draw, shared verbatim by RenderFrame() and RenderOffscreenFrame() — clears
+    // `drawView` (transparent black) and draws only the current circles into it at `extent`, additively
+    // accumulating density (see kDensityFormat's comment), then clears the circles vector. Doesn't
+    // begin/end the command buffer or touch barriers; callers own those (including transitioning
+    // `drawView`'s image to COLOR_ATTACHMENT_OPTIMAL beforehand).
     //
     // `resolveView` is VK_NULL_HANDLE when sceneSampleCount is 1 (no MSAA support): `drawView` is
-    // then the final single-sample target and this behaves exactly like the pre-MSAA version — load
+    // then the final single-sample density target and this behaves like the pre-MSAA version — load
     // /clear/store it directly, no resolve. Otherwise `drawView` must be the matching MSAA target
-    // (swapchainMsaaView/offscreenMsaaView) and `resolveView` the final single-sample image the
-    // multisampled result resolves into as part of this same pass; the MSAA image itself is left
+    // (densityMsaaView/offscreenDensityMsaaView) and `resolveView` the single-sample density image
+    // the multisampled result resolves into as part of this same pass; the MSAA image itself is left
     // DONT_CARE since nothing ever reads it back.
-    void RecordScenePass(VkImageView drawView, VkImageView resolveView, VkExtent2D extent);
+    void RecordDensityPass(VkImageView drawView, VkImageView resolveView, VkExtent2D extent);
+    // Pass 2 of the scene draw — clears `finalView` to the scene background color, draws a fullscreen
+    // triangle through `compositeSet` (must already be bound to the resolved density image the
+    // matching RecordDensityPass call just wrote — see UpdateCompositeDescSet) to turn accumulated
+    // density into real color, then draws the current rects on top and clears that vector. Callers
+    // own barriers, same contract as RecordDensityPass.
+    void RecordCompositePass(VkDescriptorSet compositeSet, VkImageView finalView, VkExtent2D extent);
     void CreateShapePipeline(const char* vertSpv, const char* fragSpv,
-                             VkDescriptorSetLayout descSetLayout,
+                             VkDescriptorSetLayout descSetLayout, VkFormat colorFormat,
+                             VkSampleCountFlagBits sampleCount, const VkPipelineColorBlendAttachmentState& blendAtt,
                              VkPipelineLayout& outLayout, VkPipeline& outPipeline);
     // `preferred` flags are matched on top of HOST_VISIBLE where available (falling back to
     // plain HOST_VISIBLE|HOST_COHERENT otherwise); pass HOST_CACHED for a readback buffer the
@@ -242,10 +284,12 @@ private:
                     VkBuffer& buf, VkDeviceMemory& mem, void*& mapped, bool* outCoherent = nullptr);
 
     // Shared image+memory+view allocation for any of this class's device-local color attachments
-    // (offscreenImage, and now the MSAA targets below) — `usage` distinguishes the ones that also
-    // need to be copy-read (TRANSFER_SRC) from the MSAA ones that only ever get rendered into.
+    // (offscreenImage, and now the MSAA/density targets below) — `usage` distinguishes the ones that
+    // also need to be copy-read (TRANSFER_SRC) or sampled (SAMPLED) from the MSAA ones that only
+    // ever get rendered into. `format` defaults to imageFormat (the swapchain/offscreen format);
+    // the density targets pass kDensityFormat instead.
     void CreateColorImage(VkExtent2D extent, VkSampleCountFlagBits samples, VkImageUsageFlags usage,
-                          VkImage& img, VkDeviceMemory& mem, VkImageView& view);
+                          VkImage& img, VkDeviceMemory& mem, VkImageView& view, VkFormat format = VK_FORMAT_UNDEFINED);
     // Destroys and nulls out an image created by CreateColorImage — a no-op if `img` is already
     // VK_NULL_HANDLE. Callers own waiting for the GPU to be done with it first.
     void DestroyColorImage(VkImage& img, VkDeviceMemory& mem, VkImageView& view);
