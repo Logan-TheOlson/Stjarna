@@ -69,7 +69,12 @@ struct SceneParticles {
     // Calibrated to smoothingRadius=15 and a grid spacing of circleRadius*3=9px — recompute
     // (lattice-sum the Poly6 kernel at the new spacing/radius) if either changes.
     float smoothingRadius    = 15.0f;
-    float targetDensity      = 6.48e-4f;
+    // 6.48e-4 was the lattice sum against the OLD 3D Poly6 normalization (315/(64*pi*h^9)).
+    // DensityKernel's shape, (h^2-r^2)^3, didn't change — only main.cpp's DensityNorm prefactor
+    // did, to the true 2D normalization (4/(pi*h^8)) — so this is corrected by the exact ratio
+    // newNorm/oldNorm = 256*h/315 at this struct's own h=15 (256*15/315 = 12.190476...), not
+    // re-derived from scratch.
+    float targetDensity      = 6.48e-4f * (256.f * 15.f / 315.f); // = 7.8994...e-3
     float stiffness          = 12000.f;
 
     EosModel eos             = EosModel::WCSPH;

@@ -90,11 +90,13 @@ namespace {
         // count change relative to OldCount. smoothingRadius scales the same way to keep the same
         // smoothingRadius/spacing ratio (and hence a still-valid density kernel), which is also
         // what makes the particles render slightly smaller at this resolution — circleRadius
-        // shrinks by the same sqrt(oldCount/newCount) factor. targetDensity does NOT scale like a
-        // plain areal density (1/scale^2) here: this kernel's DensityNorm ~ 1/h^9 with a
-        // (h^2-r^2)^3 falloff (a 3D Poly6 normalization, not the true 2D one), so a uniform spatial
-        // rescale by `scale` moves every kernel evaluation by 1/scale^3 — see main.cpp's
-        // DensityKernel/DensityNorm. At gridCountX*gridCountY == OldCount, scale == 1 and all of
+        // shrinks by the same sqrt(oldCount/newCount) factor. targetDensity scales as 1/scale^2,
+        // same as a plain 2D areal density would: this kernel's DensityNorm ~ 1/h^8 with a
+        // (h^2-r^2)^3 falloff (the true 2D Poly6 normalization — see main.cpp's DensityKernel/
+        // DensityNorm) integrates to a dimensionless 1 over the disk, so a uniform spatial rescale
+        // by `scale` moves every kernel evaluation — and hence the summed density — by exactly
+        // 1/scale^2, matching real areal density's own 1/scale^2 falloff under the same rescale.
+        // At gridCountX*gridCountY == OldCount, scale == 1 and all of
         // this is a no-op — the knob to turn for a different resolution. (gridCountX/Y need not be
         // square-ish: circular spawn only ever uses their product, see Init()'s circular branch.)
         constexpr int OldCount = 100 * 100;
@@ -106,7 +108,7 @@ namespace {
                                      / static_cast<float>(s.spawn.gridCountX * s.spawn.gridCountY));
         s.particles.circleRadius    *= scale;
         s.particles.smoothingRadius *= scale;
-        s.particles.targetDensity   /= (scale * scale * scale);
+        s.particles.targetDensity   /= (scale * scale);
 
         // CalculateDensity's kernel sum has no mass weighting at all (see main.cpp — it's a plain
         // unit-per-particle count convolved with the kernel), so nothing above touches how much

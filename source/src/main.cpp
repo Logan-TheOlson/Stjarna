@@ -242,12 +242,21 @@ void RecomputeSphConstants() {
     RadiusSq = Radius * Radius;
     CellSize = 2.f * Radius;
 
-    // radius^6 / radius^9, expanded by hand since std::pow isn't constexpr — turns a std::pow
+    // radius^5 / radius^8, expanded by hand since std::pow isn't constexpr — turns a std::pow
     // call on every particle pair into a plain multiply against a value computed once.
-    const float radius6 = RadiusSq * RadiusSq * RadiusSq;
-    const float radius9 = radius6 * RadiusSq * Radius;
-    DensityNorm      = 315.f / (64.f * Pi * radius9);
-    PressureGradNorm = -45.f / (Pi * radius6);
+    const float radius4 = RadiusSq * RadiusSq;
+    const float radius5 = radius4 * Radius;
+    const float radius8 = radius4 * radius4;
+    // True 2D Poly6/Spiky normalizations (this sim is 2D — see Genuine2D gravity), not the 3D ones
+    // (315/64/h^9, -45/h^6) an earlier version of this code used: integrating each kernel over a
+    // disk of radius h (rather than a 3D ball) gives 4/(pi*h^8) for Poly6 and -30/(pi*h^5) for
+    // Spiky's gradient. This changes the actual density values CalculateDensity reports for a given
+    // packing, which invalidates every targetDensity/stiffness calibration tuned against the old 3D
+    // norm (see Scene.cpp's MakeSelfGravity — its Lane-Emden stiffness derivation and its
+    // resolution's targetDensity/scale^3 scaling both assumed the old normalization and need
+    // re-deriving against this one).
+    DensityNorm      = 4.f / (Pi * radius8);
+    PressureGradNorm = -30.f / (Pi * radius5);
     PolytropicGamma  = 1.f + 1.f / ActiveScene.particles.polytropicIndex;
 
     // Characteristic speed for the artificial-viscosity term (CalculatePressureForce), not an
