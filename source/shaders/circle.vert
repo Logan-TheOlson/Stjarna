@@ -31,7 +31,7 @@ layout(location = 2) out float fragRadius;
 // one sample. Unlike the pre-density-buffer version of this shader, alpha is NOT scaled down by
 // the resulting area ratio — the composite pass normalizes accumulated density back to true
 // per-particle brightness, so a single isolated (enlarged) particle still reads at full opacity.
-const float kOverlapFactor  = 1.8;
+const float kOverlapFactor  = 2.6;
 const float kMinPixelRadius = 1.0;
 
 void main() {
