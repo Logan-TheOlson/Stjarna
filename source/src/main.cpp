@@ -351,6 +351,7 @@ static void CalculatePressureForce (int32_t k)
     const Vec2  vel       = hotVel[k];
     const float pDensity  = std::max(hotDensity[k], MinDensity);
     const float pPressure = hotPressure[k];
+    const bool  morris    = p.viscosityModel == ViscosityModel::Morris;
     Vec2 forceVec(0.f, 0.f);
 
     // Shared pairwise force, used for both real neighbors and ghost mirror images below.
@@ -370,7 +371,7 @@ static void CalculatePressureForce (int32_t k)
 
         Vec2 velDiff = vel - bVel;
         float approach = dot(velDiff, difference);
-        if (approach < 0.f) {
+        if (!morris && approach < 0.f) {
             const float mu = Radius * approach / (distSq + 0.01f * RadiusSq);
             const float avgDensity = (pDensity + bDensity) * 0.5f;
             coefficient += (-p.viscosity * SoundSpeed * mu
@@ -378,6 +379,19 @@ static void CalculatePressureForce (int32_t k)
         }
 
         forceVec -= dir * (grad * coefficient);
+
+        // Morris, Fox & Zhu (1997) viscosity, in this code's unit-mass / number-density form:
+        //   a_i += nu * (1/rho_i + 1/rho_j) * (r * dW/dr) / (r^2 + 0.01 h^2) * (v_i - v_j)
+        // i.e. Brookshaw's SPH Laplacian, which for smooth v tends to nu * laplacian(v) (in 2D
+        // and 3D alike). dW/dr < 0, so this always drags v_i toward v_j — along the FULL relative
+        // velocity, unlike Monaghan's term above, which only sees its component along `dir`.
+        // Uses the Spiky gradient, whose kernel is normalised in 2D like the pressure term's.
+        // Wall ghosts carry -v under no-slip (see ForEachGhost), pinning u = 0 at the wall.
+        if (morris) {
+            const float lap = p.kinematicViscosity * (1.f / pDensity + 1.f / bDensity)
+                            * dist * grad / (distSq + 0.01f * RadiusSq);
+            forceVec += velDiff * lap;
+        }
     };
 
     ForEachNeighbor(pos, [&](int32_t j) {

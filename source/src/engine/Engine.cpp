@@ -1,9 +1,11 @@
 ﻿#include "engine/Engine.h"
 #include "engine/Scene.h"
+#include "engine/ScenePresetIO.h"
 #include "renderer/App.h"
 #include "util/DataRecorder.h"
 #include "util/Filename.h"
 #include "util/Profiler.h"
+#include "util/RunNaming.h"
 #include "Config.h"
 #include <imgui.h>
 #include <algorithm>
@@ -12,6 +14,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <string>
@@ -116,26 +119,24 @@ constexpr float StepDt         = 1.f / 60.f; // fixed nominal frame length for m
                                               // step is deterministic regardless of real elapsed time
 constexpr int   BigStepFrames  = 10;         // frames advanced by Left Arrow / the "Step x10" button
 
-struct MenuConfig {
+// Recording + data-save configuration for one run — a manual "Start Simulation" click or one
+// queued entry (see QueueEntry) — kept separate from the Scene itself so a queue entry can
+// snapshot both independently.
+struct RunSettings {
     bool  record = false;
-    char  title[128] = "capture";
+    // Optional short label appended to the auto-generated filename (see RunNaming) — empty by
+    // default, unlike the old flat "capture"/"data" titles this replaces, since the generated
+    // name alone is already distinguishing.
+    char  title[128] = "";
     int   fps = 60;
     float lengthSeconds = 10.f;
     // Only meaningful alongside `record`: renders+captures every frame back-to-back at 1/fps
     // instead of pacing to real time, so the video finishes in however long that takes to compute
     // rather than lengthSeconds of real time — see AdvanceRendering.
     bool  batchRender = false;
-    int   sceneIndex = 0;
-
-    // Particle grid override, applied via BuildScene() instead of the selected preset's own
-    // count — synced from the preset's default whenever sceneIndex changes (see DrawMenu), so
-    // switching scenes doesn't carry over an unrelated count left over from a previous selection.
-    int   gridCountX = 0;
-    int   gridCountY = 0;
-    bool  circularSpawn = false; // see the same comment: synced from the preset on scene change
 
     bool  saveData = false;
-    char  dataTitle[128] = "data";
+    char  dataTitle[128] = "";
     int   dataRate = 30; // samples/sec, independent of render fps — see the "Save data to CSV" section
     float dataLengthSeconds = 10.f;
     bool  dataPosition = true;
@@ -143,17 +144,190 @@ struct MenuConfig {
     bool  dataSpeed = false;
     bool  dataDensity = true;
     bool  dataPressure = true;
+
+    // Channel velocity profile (see ProfileLogger): per-bin averages across the channel height
+    // instead of per-particle rows, so a long Poiseuille run stays well under a few MB.
+    bool  saveProfile = false;
+    char  profileTitle[128] = "";
+    int   profileRate = 5;               // samples per SIM second
+    float profileLengthSeconds = 75.f;   // sim seconds; 0 = unlimited
+    int   profileBins = 0;               // 0 = one bin per particle row (spawn.gridCountY)
+};
+
+struct MenuConfig {
+    // Index into the combined list of the 3 compiled ScenePresets followed by userPresets (see
+    // CombinedX helpers below) — not just ScenePresets, so a saved custom preset shows up in the
+    // same combo.
+    int          sceneIndex = 0;
+    // Full editable working copy — reseeded from BuildScene()/BuildSceneFromPreset() only when
+    // sceneIndex or the grid count actually changes (see DrawMenu); every other field is free to
+    // hand-edit and is left exactly as the user set it on every other frame. Assigned for real in
+    // main(), not via a default member initializer — see the comment there for why.
+    Scene        scene;
+    RunSettings  run;
 };
 static MenuConfig menuConfig;
+
+// Presets saved via the menu's "Presets" section, scanned from disk at startup and after each
+// save. Combined with the 3 compiled ScenePresets (Scene.h) into one list for the scene combo —
+// built-ins keep fixed indices [0, ScenePresets.size()), user presets follow.
+static std::vector<ScenePresetEntry> userPresets;
+
+static void RefreshUserPresets() {
+    userPresets = ScanUserPresets(ExecutableDir() / "presets");
+}
+
+static int CombinedCount() {
+    return static_cast<int>(ScenePresets.size() + userPresets.size());
+}
+static bool CombinedIsBuiltin(int i) {
+    return i < static_cast<int>(ScenePresets.size());
+}
+static const std::string& CombinedName(int i) {
+    return CombinedIsBuiltin(i) ? ScenePresets[i].name
+                                 : userPresets[i - static_cast<int>(ScenePresets.size())].name;
+}
+static const std::string& CombinedDescription(int i) {
+    return CombinedIsBuiltin(i) ? ScenePresets[i].description
+                                 : userPresets[i - static_cast<int>(ScenePresets.size())].description;
+}
 
 // Owned directly by Engine.cpp (unlike Recorder, which lives behind App/VulkanContext because it
 // needs the composited GPU frame) since the data it samples — `objects` — already lives here.
 static DataRecorder dataRecorder;
-static float        dataAccum{ 0.f };        // seconds since the last sample, gated at menuConfig.dataRate like Recorder's fps gate
+static float        dataAccum{ 0.f };        // seconds since the last sample, gated at the active run's dataRate, like Recorder's fps gate
 static float        dataElapsed{ 0.f };       // sim seconds since this data save started, for the CSV's time column
 static uint32_t     dataSavedFrames{ 0 };
 static int          dataRateActive{ 0 };
-static float        dataLengthActive{ 0.f };  // 0 = unlimited, mirrors menuConfig.lengthSeconds for video
+static float        dataLengthActive{ 0.f };  // 0 = unlimited, mirrors the active run's video length cap
+
+// Defined further down; declared here for ProfileLogger.
+float ScreenHalfWidth();
+float ScreenHalfHeight();
+
+// Simulated seconds since the last ResetSimulation() — advanced only by AdvanceSimulation, so it
+// stops while paused and is exact in both live and batch modes (unlike the real-time dt the
+// per-particle data save accumulates).
+static double simTime = 0.0;
+
+// Channel velocity-profile logger for Poiseuille-type runs. Every 1/rate simulated seconds it bins
+// particles by y across the channel ([-H/2, H/2], wall to wall) and writes two small CSVs:
+//   <name>_profile.csv : frame,time,bin,y_center,count,mean_vx,std_vx,mean_vy,mean_density
+//   <name>_frames.csv  : frame,time,mean_vx,max_vx,rms_vy,mean_density,std_density,min_density,max_density
+// Both start with '#'-prefixed lines recording the run's geometry and parameters (H and L as
+// actually used, so the analysis never has to assume them) — read with pandas' comment='#'.
+// Written synchronously on the sim thread: one sample is only nBins+1 rows.
+struct ProfileLogger {
+    std::ofstream profile;
+    std::ofstream frames;
+    int    nBins       = 0;
+    int    rate        = 5;
+    float  length      = 0.f;
+    int    savedFrames = 0;
+
+    bool IsActive() const { return profile.is_open(); }
+    double NextSampleTime() const { return static_cast<double>(savedFrames) / rate; }
+    float SavedSeconds() const { return savedFrames > 0 ? static_cast<float>(savedFrames - 1) / rate : 0.f; }
+
+    void Stop() {
+        if (profile.is_open()) profile.close();
+        if (frames.is_open())  frames.close();
+    }
+
+    bool Start(const std::filesystem::path& base, int sampleRate, float lengthSeconds, int bins) {
+        Stop();
+        const auto& s = ActiveScene;
+        nBins       = bins > 0 ? bins : std::max(s.spawn.gridCountY, 1);
+        rate        = std::clamp(sampleRate, 1, 240);
+        length      = std::max(lengthSeconds, 0.f);
+        savedFrames = 0;
+
+        profile.open(base.string() + "_profile.csv", std::ios::out | std::ios::trunc);
+        frames.open(base.string() + "_frames.csv", std::ios::out | std::ios::trunc);
+        if (!profile.is_open() || !frames.is_open()) {
+            fprintf(stderr, "ProfileLogger: failed to open %s_*.csv\n", base.string().c_str());
+            Stop();
+            return false;
+        }
+
+        const auto& p = s.particles;
+        const bool  morris = p.viscosityModel == ViscosityModel::Morris;
+        for (std::ofstream* f : { &profile, &frames }) {
+            *f << "# scene=" << s.name << '\n'
+               << "# H=" << 2.f * ScreenHalfHeight() << '\n'
+               << "# L=" << 2.f * ScreenHalfWidth() << '\n'
+               << "# N=" << objects.size() << '\n'
+               << "# gridCountX=" << s.spawn.gridCountX << '\n'
+               << "# gridCountY=" << s.spawn.gridCountY << '\n'
+               << "# spacing=" << p.circleRadius * 3.f << '\n'
+               << "# h=" << p.smoothingRadius << '\n'
+               << "# eos=" << (p.eos == EosModel::WCSPH ? "WCSPH" : "Polytropic") << '\n'
+               << "# stiffness=" << p.stiffness << '\n'
+               << "# c=" << std::sqrt(p.stiffness) << '\n' // WCSPH reference sound speed
+               << "# targetDensity=" << p.targetDensity << '\n'
+               << "# viscosityModel=" << (morris ? "Morris" : "Monaghan") << '\n'
+               << "# nu=" << (morris ? p.kinematicViscosity : 0.f) << '\n'
+               << "# alpha=" << (morris ? 0.f : p.viscosity) << '\n'
+               << "# beta=" << (morris ? 0.f : p.viscosityQuadratic) << '\n'
+               << "# forceX=" << s.physics.force.x << '\n'
+               << "# forceY=" << s.physics.force.y << '\n'
+               << "# noSlipWalls=" << (s.physics.noSlipWalls ? 1 : 0) << '\n'
+               << "# periodicX=" << (s.boundary.periodicX ? 1 : 0) << '\n'
+               << "# substeps=" << s.physics.substeps << '\n'
+               << "# sampleRate=" << rate << '\n'
+               << "# bins=" << nBins << '\n';
+        }
+        profile << "frame,time,bin,y_center,count,mean_vx,std_vx,mean_vy,mean_density\n";
+        frames  << "frame,time,mean_vx,max_vx,rms_vy,mean_density,std_density,min_density,max_density\n";
+
+        Sample(); // t = 0: the initial condition, before any step
+        return true;
+    }
+
+    void Sample() {
+        if (!IsActive()) return;
+        const float hh   = ScreenHalfHeight();
+        const float binH = 2.f * hh / static_cast<float>(nBins);
+
+        std::vector<int>    count(nBins, 0);
+        std::vector<double> sVx(nBins, 0.0), sVx2(nBins, 0.0), sVy(nBins, 0.0), sRho(nBins, 0.0);
+        double gVx = 0.0, gVy2 = 0.0, gRho = 0.0, gRho2 = 0.0;
+        double maxVx = -1e30, minRho = 1e30, maxRho = -1e30;
+
+        for (const auto& obj : objects) {
+            const int b = std::clamp(static_cast<int>((obj.pos.y + hh) / binH), 0, nBins - 1);
+            const double vx = obj.vel.x, vy = obj.vel.y, rho = obj.density;
+            count[b]++; sVx[b] += vx; sVx2[b] += vx * vx; sVy[b] += vy; sRho[b] += rho;
+            gVx += vx; gVy2 += vy * vy; gRho += rho; gRho2 += rho * rho;
+            maxVx  = std::max(maxVx, vx);
+            minRho = std::min(minRho, rho);
+            maxRho = std::max(maxRho, rho);
+        }
+
+        const int    frame = savedFrames;
+        const double t     = simTime;
+        for (int b = 0; b < nBins; b++) {
+            const double yc = -hh + (b + 0.5) * binH;
+            const int    c  = count[b];
+            const double mVx  = c ? sVx[b] / c : 0.0;
+            const double var  = c ? std::max(sVx2[b] / c - mVx * mVx, 0.0) : 0.0;
+            profile << frame << ',' << t << ',' << b << ',' << yc << ',' << c << ','
+                    << mVx << ',' << std::sqrt(var) << ','
+                    << (c ? sVy[b] / c : 0.0) << ',' << (c ? sRho[b] / c : 0.0) << '\n';
+        }
+
+        const double n    = std::max<double>(static_cast<double>(objects.size()), 1.0);
+        const double mRho = gRho / n;
+        frames << frame << ',' << t << ',' << gVx / n << ',' << maxVx << ','
+               << std::sqrt(gVy2 / n) << ',' << mRho << ','
+               << std::sqrt(std::max(gRho2 / n - mRho * mRho, 0.0)) << ','
+               << minRho << ',' << maxRho << '\n';
+
+        savedFrames++;
+        if (length > 0.f && t + 1e-6 >= length) Stop();
+    }
+};
+static ProfileLogger profileLogger;
 
 // Identifies which Start-Simulation/Restart session a KESample belongs to (see WriteKineticEnergyCsv).
 static int runIndex = -1;
@@ -226,6 +400,144 @@ static void DrawColorByControls(float contentWidth) {
     }
 }
 
+// Per-Scene-sub-struct editable sections for the menu's CollapsingHeaders (see DrawMenu) — split
+// out the same way DrawColorByControls is, one function per struct rather than one giant flat
+// block, so each preset's full parameter set is reachable without recompiling.
+
+// One labelled input row: the label in a fixed left-hand column (wrapping onto a second line if
+// it's long), the widget filling the right-hand column. Every labelled menu field goes through
+// this. The old layout drew the label to the RIGHT of the widget and shrank the widget by the
+// label's width , so a long label squeezed the input box and its +/-
+// buttons until the value was cut off. Here the widget width never depends on the label.
+// Call immediately before the widget, and give the widget a "##"-hidden label.
+static void FormRow(float contentWidth, const char* label) {
+    const float labelW  = std::floor(contentWidth * 0.52f);
+    const float startX  = ImGui::GetCursorPosX();
+    const float spacing = ImGui::GetStyle().ItemInnerSpacing.x;
+    ImGui::AlignTextToFramePadding();
+    ImGui::PushTextWrapPos(startX + labelW - spacing);
+    ImGui::TextUnformatted(label);
+    ImGui::PopTextWrapPos();
+    ImGui::SameLine();
+    ImGui::SetCursorPosX(startX + labelW);
+    ImGui::SetNextItemWidth(contentWidth - labelW);
+}
+
+static void DrawSpawnSection(SceneSpawn& spawn, float contentWidth) {
+    FormRow(contentWidth, "Offset X (frac)");
+    ImGui::SliderFloat("##Offset X (frac)", &spawn.offsetXFrac, -1.f, 1.f, "%.2f");
+}
+
+static void DrawBoundarySection(SceneBoundary& b, float contentWidth) {
+    FormRow(contentWidth, "Width (frac)");
+    ImGui::SliderFloat("##Width (frac)", &b.widthFrac, 0.05f, 1.f, "%.2f");
+    FormRow(contentWidth, "Height (frac)");
+    ImGui::SliderFloat("##Height (frac)", &b.heightFrac, 0.05f, 1.f, "%.2f");
+    // > 0 overrides the matching fraction above with a fixed size (see SceneBoundary).
+    FormRow(contentWidth, "Half-width (px, 0 = frac)");
+    ImGui::InputFloat("##Half-width (px, 0 = frac)", &b.halfWidthPx);
+    FormRow(contentWidth, "Half-height (px, 0 = frac)");
+    ImGui::InputFloat("##Half-height (px, 0 = frac)", &b.halfHeightPx);
+    ImGui::Checkbox("Periodic X", &b.periodicX);
+}
+
+static void DrawPhysicsSection(ScenePhysics& p, float contentWidth) {
+    FormRow(contentWidth, "Force (x, y)");
+    ImGui::InputFloat2("##Force (x, y)", &p.force.x);
+    FormRow(contentWidth, "Restitution");
+    ImGui::SliderFloat("##Restitution", &p.restitution, 0.f, 1.f, "%.2f");
+    FormRow(contentWidth, "Friction");
+    ImGui::SliderFloat("##Friction", &p.friction, 0.f, 1.f, "%.2f");
+    ImGui::Checkbox("No-slip walls", &p.noSlipWalls);
+    FormRow(contentWidth, "Substeps");
+    ImGui::InputInt("##Substeps", &p.substeps);
+    p.substeps = std::max(p.substeps, 1);
+    FormRow(contentWidth, "Force interval");
+    ImGui::InputInt("##Force interval", &p.forceInterval);
+    p.forceInterval = std::max(p.forceInterval, 1);
+}
+
+static const char* GravityMethodNames[] = { "Barnes-Hut", "Genuine 2D" };
+
+static void DrawGravitySection(SceneGravity& g, float contentWidth) {
+    ImGui::Checkbox("Enabled", &g.enabled);
+    if (!g.enabled) return;
+
+    int methodIdx = static_cast<int>(g.method);
+    FormRow(contentWidth, "Method");
+    if (ImGui::Combo("##Method", &methodIdx, GravityMethodNames, IM_ARRAYSIZE(GravityMethodNames)))
+        g.method = static_cast<GravityMethod>(methodIdx);
+
+    FormRow(contentWidth, "G");
+    ImGui::InputFloat("##G", &g.g);
+    FormRow(contentWidth, "Particle mass");
+    ImGui::InputFloat("##Particle mass", &g.particleMass);
+    FormRow(contentWidth, "Softening");
+    ImGui::InputFloat("##Softening", &g.softening);
+
+    if (g.method == GravityMethod::BarnesHut) {
+        FormRow(contentWidth, "MAC theta");
+        ImGui::SliderFloat("##MAC theta", &g.macTheta, 0.1f, 1.5f, "%.2f");
+        FormRow(contentWidth, "Max leaf particles");
+        ImGui::InputInt("##Max leaf particles", &g.maxLeafParticles);
+        g.maxLeafParticles = std::max(g.maxLeafParticles, 1);
+    }
+    ImGui::Checkbox("Validate vs. brute-force", &g.validate);
+}
+
+static const char* EosModelNames[] = { "WCSPH", "Polytropic" };
+static const char* ViscosityModelNames[] = { "Monaghan (artificial)", "Morris (physical)" };
+
+static void DrawParticlesSection(SceneParticles& pr, float contentWidth) {
+    FormRow(contentWidth, "Circle radius");
+    ImGui::InputFloat("##Circle radius", &pr.circleRadius);
+
+    // Label on the left, swatch pinned to the content's right edge, same NoInputs-swatch pattern
+    // DrawColorByControls uses for its Low/High rows — a full ColorEdit4 (4 numeric fields plus a
+    // swatch) is wider than contentWidth allows room for a trailing label at all.
+    {
+        const float swatchSize = ImGui::GetFrameHeight();
+        ImGui::AlignTextToFramePadding();
+        ImGui::TextUnformatted("Circle color");
+        ImGui::SameLine(contentWidth - swatchSize);
+        ImGui::ColorEdit4("##circlecolor", &pr.circleColor.r, ImGuiColorEditFlags_NoInputs);
+    }
+
+    FormRow(contentWidth, "Smoothing radius");
+    ImGui::InputFloat("##Smoothing radius", &pr.smoothingRadius);
+    FormRow(contentWidth, "Target density");
+    ImGui::InputFloat("##Target density", &pr.targetDensity, 0.f, 0.f, "%.6f");
+    FormRow(contentWidth, "Stiffness");
+    ImGui::InputFloat("##Stiffness", &pr.stiffness);
+
+    int eosIdx = static_cast<int>(pr.eos);
+    FormRow(contentWidth, "EOS");
+    if (ImGui::Combo("##EOS", &eosIdx, EosModelNames, IM_ARRAYSIZE(EosModelNames)))
+        pr.eos = static_cast<EosModel>(eosIdx);
+    if (pr.eos == EosModel::WCSPH) {
+        FormRow(contentWidth, "Exponent");
+        ImGui::InputInt("##Exponent", &pr.exponent);
+    } else {
+        FormRow(contentWidth, "Polytropic index");
+        ImGui::InputFloat("##Polytropic index", &pr.polytropicIndex);
+    }
+
+    int viscIdx = static_cast<int>(pr.viscosityModel);
+    FormRow(contentWidth, "Viscosity model");
+    if (ImGui::Combo("##Viscosity model", &viscIdx, ViscosityModelNames, IM_ARRAYSIZE(ViscosityModelNames)))
+        pr.viscosityModel = static_cast<ViscosityModel>(viscIdx);
+    if (pr.viscosityModel == ViscosityModel::Monaghan) {
+        FormRow(contentWidth, "Viscosity");
+        ImGui::InputFloat("##Viscosity", &pr.viscosity);
+        FormRow(contentWidth, "Viscosity (quadratic)");
+        ImGui::InputFloat("##Viscosity (quadratic)", &pr.viscosityQuadratic);
+    } else {
+        FormRow(contentWidth, "Kinematic viscosity (px^2/s)");
+        ImGui::InputFloat("##Kinematic viscosity (px^2/s)", &pr.kinematicViscosity);
+        pr.kinematicViscosity = std::max(pr.kinematicViscosity, 0.f);
+    }
+}
+
 // Defined further down (needs ScreenHalfWidth/Height); forward-declared so AdvanceSimulation can
 // call it despite living earlier in the file, next to the other pause/step/menu logic.
 static void Integrate(float subDt);
@@ -236,6 +548,11 @@ static void ResetSimulation() {
     runIndex++;
     paused = false;
     cameraOffsetX = 0.f;
+    // A restarted sim starts again from t = 0, so an in-progress profile would get a second,
+    // overlapping time series appended to it — end it instead. (StartRun starts a fresh one after
+    // its own ResetSimulation call.)
+    profileLogger.Stop();
+    simTime = 0.0;
 }
 
 // Advances one substep loop's worth of physics by dt — factored out of the main loop so manual
@@ -254,6 +571,10 @@ static void AdvanceSimulation(float dt) {
         }
         Integrate(subDt);
     }
+
+    simTime += dt;
+    if (profileLogger.IsActive() && simTime + 1e-6 >= profileLogger.NextSampleTime())
+        profileLogger.Sample();
 }
 
 static void TogglePause() { paused = !paused; }
@@ -263,39 +584,114 @@ static void TogglePause() { paused = !paused; }
 static void StepOnce() { paused = true; AdvanceSimulation(StepDt); }
 static void StepBig()  { paused = true; for (int i = 0; i < BigStepFrames; i++) AdvanceSimulation(StepDt); }
 
-static void StartSimulationFromMenu() {
-    Scene scene = BuildScene(menuConfig.sceneIndex, menuConfig.gridCountX, menuConfig.gridCountY);
-    scene.spawn.circular = menuConfig.circularSpawn;
+// The recording/data-save configuration currently driving Running/Rendering — set by StartRun so
+// AdvanceRendering's frame rate and DrawRenderingOverlay's progress display reflect whichever
+// entry (manual or queued) is actually active, not always menuConfig.run.
+static RunSettings activeRun;
+
+// One queued run: a full Scene snapshot plus its own recording/data-save settings, captured by
+// value at "Add to Queue" time so later menu edits never retroactively change an already-queued
+// entry.
+struct QueueEntry {
+    Scene       scene;
+    RunSettings run;
+};
+static std::vector<QueueEntry> runQueue;
+static int  queueRunningIndex = -1; // -1 = no queue run in progress; runQueue itself is never
+                                     // cleared by that, so "Run Queue" can be pressed again after.
+
+// A queued entry needs some condition that will actually end its batch run on its own, or the
+// queue would stall forever on it — checked at "Add to Queue" time (see DrawMenu's Run Queue
+// section).
+static bool HasDeterministicEnd(const RunSettings& run) {
+    return (run.record      && run.lengthSeconds        > 0.f) ||
+           (run.saveData    && run.dataLengthSeconds    > 0.f) ||
+           (run.saveProfile && run.profileLengthSeconds > 0.f);
+}
+
+static void AdvanceQueue();
+
+// Loads `scene`, resets the sim, and starts whatever recording/data-save `run` requests — the
+// shared core behind a manual "Start Simulation" click and a queued entry's turn. `forceBatch` is
+// true for every queue entry (so a queued run is always unattended/offscreen, never live Running,
+// since only batch mode has a deterministic end) and false for a manual run, which uses its own
+// `run.batchRender` checkbox instead.
+static void StartRun(const Scene& scene, const RunSettings& run, bool forceBatch) {
     LoadScene(scene);
     ResetSimulation();
-    bool recording = false;
-    if (menuConfig.record)
-        recording = app.StartRecording(menuConfig.title, menuConfig.fps, menuConfig.lengthSeconds);
-    if (menuConfig.saveData) {
+    activeRun = run;
+
+    // Shared by both outputs below, so a run's video and CSV carry the same run number and are
+    // recognizable as belonging to the same run at a glance.
+    const std::string runBase = RunNaming::BuildBaseName({
+        .sceneName      = scene.name,
+        .gridCountX     = scene.spawn.gridCountX,
+        .gridCountY     = scene.spawn.gridCountY,
+        .gravityEnabled = scene.gravity.enabled,
+        .gravityG       = scene.gravity.g,
+        .stiffness      = scene.particles.stiffness,
+        .runNumber      = RunNaming::NextRunNumber(),
+    });
+
+    bool recording   = false;
+    bool dataStarted = false;
+
+    if (run.record) {
+        std::string name = runBase;
+        if (std::strlen(run.title) > 0) name += "_" + SanitizeFilename(run.title, "");
+        name = RunNaming::EnsureUniqueBaseName(name, { { ExecutableDir() / "recordings", ".mp4" } });
+        recording = app.StartRecording(name, run.fps, run.lengthSeconds);
+    }
+
+    if (run.saveData) {
         DataRecorder::Fields fields;
-        fields.position = menuConfig.dataPosition;
-        fields.velocity = menuConfig.dataVelocity;
-        fields.speed    = menuConfig.dataSpeed;
-        fields.density  = menuConfig.dataDensity;
-        fields.pressure = menuConfig.dataPressure;
+        fields.position = run.dataPosition;
+        fields.velocity = run.dataVelocity;
+        fields.speed    = run.dataSpeed;
+        fields.density  = run.dataDensity;
+        fields.pressure = run.dataPressure;
 
         const auto  dir = ExecutableDir() / "data";
         std::error_code ec;
         std::filesystem::create_directories(dir, ec);
-        const std::string safeTitle = SanitizeFilename(menuConfig.dataTitle, "data");
-        if (!ec && dataRecorder.Start((dir / (safeTitle + ".csv")).string(), fields)) {
-            dataRateActive   = std::clamp(menuConfig.dataRate, 1, 240);
-            dataLengthActive = menuConfig.dataLengthSeconds;
+        std::string name = runBase;
+        if (std::strlen(run.dataTitle) > 0) name += "_" + SanitizeFilename(run.dataTitle, "");
+        name = RunNaming::EnsureUniqueBaseName(name, { { dir, ".csv" } });
+        if (!ec && dataRecorder.Start((dir / (name + ".csv")).string(), fields)) {
+            dataStarted      = true;
+            dataRateActive   = std::clamp(run.dataRate, 1, 240);
+            dataLengthActive = run.dataLengthSeconds;
             dataAccum        = 0.f;
             dataElapsed      = 0.f;
             dataSavedFrames  = 0;
         }
     }
 
-    // batchRender only makes sense with an active recording to drive it — if StartRecording()
-    // failed (e.g. ffmpeg missing), fall back to Running rather than entering a Rendering state
-    // that would just find app.IsRecording() false immediately and bounce straight back to Menu.
-    if (recording && menuConfig.batchRender) {
+    bool profileStarted = false;
+    if (run.saveProfile) {
+        const auto  dir = ExecutableDir() / "data";
+        std::error_code ec;
+        std::filesystem::create_directories(dir, ec);
+        // Viscosity model + its parameter in the name, since RunNaming's base name doesn't carry
+        // them and they're what distinguishes one Poiseuille run from the next.
+        const auto& p = scene.particles;
+        char tag[96];
+        if (p.viscosityModel == ViscosityModel::Morris)
+            std::snprintf(tag, sizeof(tag), "_Morris_nu%g", p.kinematicViscosity);
+        else
+            std::snprintf(tag, sizeof(tag), "_Monaghan_a%g_b%g", p.viscosity, p.viscosityQuadratic);
+        std::string name = runBase + tag;
+        if (std::strlen(run.profileTitle) > 0) name += "_" + SanitizeFilename(run.profileTitle, "");
+        name = RunNaming::EnsureUniqueBaseName(name, { { dir, "_profile.csv" } });
+        if (!ec)
+            profileStarted = profileLogger.Start(dir / name, run.profileRate,
+                                                 run.profileLengthSeconds, run.profileBins);
+    }
+
+    // Entering Rendering only makes sense if something is actually active to drive it — if every
+    // output failed to start (e.g. ffmpeg missing and a disk error), fall back to Running rather
+    // than a Rendering state AdvanceRendering would find already finished.
+    if ((forceBatch || run.batchRender) && (recording || dataStarted || profileStarted)) {
         // AdvanceRendering captures every video frame itself via RenderOffscreenFrame; the
         // per-tick RenderFrame() call (see main()) is only there to keep the progress overlay on
         // screen and must not also feed the recorder — see SetCaptureFromSwapchain.
@@ -306,6 +702,24 @@ static void StartSimulationFromMenu() {
     }
 }
 
+static void StartSimulationFromMenu() {
+    StartRun(menuConfig.scene, menuConfig.run, /*forceBatch=*/false);
+}
+
+// Starts queue entry `entry` in forced-batch mode; if it fails to actually start anything (see
+// StartRun's fallback), immediately advances past it instead of stalling in Running with no
+// auto-advance path (AdvanceQueue is only reachable from AdvanceRendering).
+static void StartQueueEntry(const QueueEntry& entry) {
+    StartRun(entry.scene, entry.run, /*forceBatch=*/true);
+    if (appState != AppState::Rendering) AdvanceQueue();
+}
+
+static void StartQueue() {
+    if (runQueue.empty()) return;
+    queueRunningIndex = 0;
+    StartQueueEntry(runQueue[0]);
+}
+
 // Resets the sim in place without leaving Running (and without touching any active recording or
 // data save) — distinct from ReturnToMenu, which is the "stop and reconfigure" path.
 static void RestartSimulation() {
@@ -313,13 +727,33 @@ static void RestartSimulation() {
 }
 
 static void ReturnToMenu() {
+    queueRunningIndex = -1; // abort the rest of the queue, if any; runQueue itself stays intact
     app.StopRecording();
     dataRecorder.Stop();
+    profileLogger.Stop();
     objects.clear();
     // Restore the default so the next live recording (Running, not batchRender) captures normally
     // — only batch rendering ever turns this off.
     app.SetCaptureFromSwapchain(true);
     appState = AppState::Menu;
+}
+
+// Stops whatever the just-finished queue entry left active and starts the next one, or returns to
+// Menu once the queue is exhausted — mirrors ReturnToMenu's stop calls but leaves runQueue itself
+// intact, so "Run Queue" can be pressed again afterward.
+static void AdvanceQueue() {
+    app.StopRecording();
+    dataRecorder.Stop();
+    profileLogger.Stop();
+    queueRunningIndex++;
+    if (queueRunningIndex >= static_cast<int>(runQueue.size())) {
+        queueRunningIndex = -1;
+        objects.clear();
+        app.SetCaptureFromSwapchain(true);
+        appState = AppState::Menu;
+        return;
+    }
+    StartQueueEntry(runQueue[queueRunningIndex]);
 }
 
 static void DrawMenu() {
@@ -334,25 +768,29 @@ static void DrawMenu() {
         return ImGui::GetFrameHeight() + ImGui::GetStyle().ItemInnerSpacing.x + ImGui::CalcTextSize(label).x;
     };
     const float MenuContentWidth = std::max({
-        260.f,
+        // Floor wide enough that FormRow's right-hand column (~48%) still fits an InputFloat's
+        // value plus its +/- step buttons comfortably.
+        360.f,
         CheckboxWidth("Record to video"),
         CheckboxWidth("Render as fast as possible (no live playback)"),
         CheckboxWidth("Circular spawn"),
         CheckboxWidth("Save data to CSV"),
+        CheckboxWidth("Save channel velocity profile"),
     });
-    // Width for an input whose own trailing label (e.g. InputInt's "Grid X") renders past the
-    // box — reserves that label's space out of MenuContentWidth so box+label together land
-    // exactly on the wrap boundary above instead of a few pixels past it, which otherwise wraps
-    // the label onto its own line (PushTextWrapPos affects every Text-family draw, including a
-    // widget's own trailing label).
-    auto LabeledItemWidth = [&](const char* label) {
-        return MenuContentWidth - ImGui::CalcTextSize(label).x - ImGui::GetStyle().ItemInnerSpacing.x;
-    };
+    // Labelled fields below all go through FormRow(MenuContentWidth, ...): label left, box right.
 
+    // Fixed height (not ImGuiWindowFlags_AlwaysAutoResize) so the many CollapsingHeader sections
+    // and conditional rows below — expanding/collapsing a header, toggling gravity or a record/
+    // save-data checkbox, growing the run queue — don't visibly resize the window on every such
+    // change; content taller than this scrolls instead (ImGui adds a scrollbar automatically once
+    // content overflows a non-auto-resize window). Width still auto-fits MenuContentWidth each
+    // frame (SetNextWindowSize's 0-axis convention), which in practice never changes frame to
+    // frame since it's derived from fixed label/style metrics, not from what's expanded.
     const ImGuiIO& io = ImGui::GetIO();
     ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f, io.DisplaySize.y * 0.5f), ImGuiCond_Always, ImVec2(0.5f, 0.5f));
+    ImGui::SetNextWindowSize(ImVec2(0.f, io.DisplaySize.y * 0.85f), ImGuiCond_Always);
     ImGui::SetNextWindowBgAlpha(0.9f);
-    ImGui::Begin("Stjarna", nullptr, ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoCollapse);
+    ImGui::Begin("Stjarna", nullptr, ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoCollapse);
     ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + MenuContentWidth);
 
     ImGui::TextUnformatted("SPH Fluid Simulation");
@@ -360,96 +798,192 @@ static void DrawMenu() {
 
     ImGui::TextUnformatted("Scene");
     ImGui::SetNextItemWidth(MenuContentWidth);
-    if (ImGui::BeginCombo("##scene", ScenePresets[menuConfig.sceneIndex].name)) {
-        for (int i = 0; i < static_cast<int>(ScenePresets.size()); i++) {
+    if (ImGui::BeginCombo("##scene", CombinedName(menuConfig.sceneIndex).c_str())) {
+        for (int i = 0; i < CombinedCount(); i++) {
             const bool isSelected = (i == menuConfig.sceneIndex);
-            if (ImGui::Selectable(ScenePresets[i].name, isSelected))
+            if (ImGui::Selectable(CombinedName(i).c_str(), isSelected))
                 menuConfig.sceneIndex = i;
             if (isSelected) ImGui::SetItemDefaultFocus();
         }
         ImGui::EndCombo();
     }
-    // Bound only after the combo above has had a chance to change sceneIndex this same frame —
-    // a reference bound before that point would keep aliasing the *previous* selection for the
-    // rest of this function (references don't rebind when the index changes later), which used
-    // to make the grid-count reset below copy the old scene's spawn instead of the new one.
-    const Scene& selectedScene = ScenePresets[menuConfig.sceneIndex];
-    ImGui::TextUnformatted(selectedScene.description);
-
-    // Reset to the newly-selected preset's own count on every scene change (including the very
-    // first DrawMenu call, since lastSyncedSceneIndex starts at a value no real sceneIndex can
-    // equal) rather than carrying over whatever count an unrelated previous scene left behind.
-    static int lastSyncedSceneIndex = -1;
-    if (menuConfig.sceneIndex != lastSyncedSceneIndex) {
-        menuConfig.gridCountX    = selectedScene.spawn.gridCountX;
-        menuConfig.gridCountY    = selectedScene.spawn.gridCountY;
-        menuConfig.circularSpawn = selectedScene.spawn.circular;
-        lastSyncedSceneIndex     = menuConfig.sceneIndex;
-    }
+    ImGui::TextUnformatted(CombinedDescription(menuConfig.sceneIndex).c_str());
+    if (!CombinedIsBuiltin(menuConfig.sceneIndex))
+        ImGui::TextDisabled("Custom preset: resizing the grid below won't re-tune its physics constants.");
 
     ImGui::Separator();
     ImGui::TextUnformatted("Particles");
-    ImGui::SetNextItemWidth(LabeledItemWidth("Grid X"));
-    ImGui::InputInt("Grid X", &menuConfig.gridCountX);
-    ImGui::SetNextItemWidth(LabeledItemWidth("Grid Y"));
-    ImGui::InputInt("Grid Y", &menuConfig.gridCountY);
-    menuConfig.gridCountX = std::max(menuConfig.gridCountX, 1);
-    menuConfig.gridCountY = std::max(menuConfig.gridCountY, 1);
-    ImGui::Checkbox("Circular spawn", &menuConfig.circularSpawn);
-    ImGui::TextDisabled("%d particles", menuConfig.gridCountX * menuConfig.gridCountY);
+    int gridX = menuConfig.scene.spawn.gridCountX;
+    int gridY = menuConfig.scene.spawn.gridCountY;
+    FormRow(MenuContentWidth, "Grid X");
+    const bool gridXEdited = ImGui::InputInt("##Grid X", &gridX);
+    FormRow(MenuContentWidth, "Grid Y");
+    const bool gridYEdited = ImGui::InputInt("##Grid Y", &gridY);
+    gridX = std::max(gridX, 1);
+    gridY = std::max(gridY, 1);
+
+    // Reseeds menuConfig.scene from scratch (the preset factory, or the preset file) whenever the
+    // scene selection or the grid count actually changes this frame — including the very first
+    // DrawMenu call, since lastSyncedSceneIndex starts at a value no real sceneIndex can equal.
+    // Every other field is left exactly as the user last edited it on every other frame; see the
+    // CollapsingHeader sections below.
+    static int lastSyncedSceneIndex = -1;
+    if (menuConfig.sceneIndex != lastSyncedSceneIndex) {
+        if (CombinedIsBuiltin(menuConfig.sceneIndex)) {
+            const Scene& preset = ScenePresets[menuConfig.sceneIndex];
+            menuConfig.scene = BuildScene(menuConfig.sceneIndex, preset.spawn.gridCountX, preset.spawn.gridCountY);
+        } else {
+            Scene loaded;
+            if (LoadScenePreset(userPresets[menuConfig.sceneIndex - static_cast<int>(ScenePresets.size())].path, loaded))
+                menuConfig.scene = loaded;
+        }
+        lastSyncedSceneIndex = menuConfig.sceneIndex;
+    } else if (gridXEdited || gridYEdited) {
+        menuConfig.scene = CombinedIsBuiltin(menuConfig.sceneIndex)
+            ? BuildScene(menuConfig.sceneIndex, gridX, gridY)
+            : BuildSceneFromPreset(userPresets[menuConfig.sceneIndex - static_cast<int>(ScenePresets.size())], gridX, gridY);
+    }
+
+    ImGui::Checkbox("Circular spawn", &menuConfig.scene.spawn.circular);
+    ImGui::TextDisabled("%d particles", menuConfig.scene.spawn.gridCountX * menuConfig.scene.spawn.gridCountY);
     ImGui::TextDisabled("Real-Time Limit: %d particles",
-                         selectedScene.realTimeLimitX * selectedScene.realTimeLimitY);
+                         menuConfig.scene.realTimeLimitX * menuConfig.scene.realTimeLimitY);
+
+    if (ImGui::CollapsingHeader("Spawn"))           DrawSpawnSection(menuConfig.scene.spawn, MenuContentWidth);
+    if (ImGui::CollapsingHeader("Boundary"))        DrawBoundarySection(menuConfig.scene.boundary, MenuContentWidth);
+    if (ImGui::CollapsingHeader("Physics"))         DrawPhysicsSection(menuConfig.scene.physics, MenuContentWidth);
+    if (ImGui::CollapsingHeader("Gravity"))         DrawGravitySection(menuConfig.scene.gravity, MenuContentWidth);
+    if (ImGui::CollapsingHeader("Particles / EOS")) DrawParticlesSection(menuConfig.scene.particles, MenuContentWidth);
+
+    // Always visible (not nested under "Record to video") so velocity/density gradient coloring
+    // can be set up before a run starts regardless of whether it's being recorded — previously
+    // only reachable by first checking "Record to video", or live via DrawRunningOverlay's corner
+    // panel once already running.
+    if (ImGui::CollapsingHeader("Color By")) DrawColorByControls(MenuContentWidth);
+
+    if (ImGui::CollapsingHeader("Presets")) {
+        static char presetSaveName[128] = "";
+        FormRow(MenuContentWidth, "Name");
+        ImGui::InputText("##Name", presetSaveName, sizeof(presetSaveName));
+        if (ImGui::Button("Save Current as Preset", ImVec2(MenuContentWidth, 0.f)) && std::strlen(presetSaveName) > 0) {
+            const auto dir = ExecutableDir() / "presets";
+            std::error_code ec;
+            std::filesystem::create_directories(dir, ec);
+            if (!ec) {
+                const std::string safeName = SanitizeFilename(presetSaveName, "preset");
+                const auto presetPath = dir / (safeName + ".scenepreset");
+                menuConfig.scene.name = presetSaveName;
+                SaveScenePreset(presetPath, menuConfig.scene);
+                RefreshUserPresets();
+
+                // ScanUserPresets sorts by name, so re-scanning can shift every user preset's
+                // index — re-point sceneIndex (and lastSyncedSceneIndex, to match, so this
+                // doesn't itself trigger a reseed) at the just-saved file instead of leaving it
+                // aimed at whatever now sits at the old index.
+                for (int i = 0; i < static_cast<int>(userPresets.size()); i++) {
+                    if (userPresets[i].path == presetPath) {
+                        menuConfig.sceneIndex = static_cast<int>(ScenePresets.size()) + i;
+                        lastSyncedSceneIndex  = menuConfig.sceneIndex;
+                        break;
+                    }
+                }
+            }
+        }
+        ImGui::TextDisabled("Saved presets appear in the Scene list above.");
+    }
 
     ImGui::Separator();
-    ImGui::Checkbox("Record to video", &menuConfig.record);
-    if (menuConfig.record) {
-        ImGui::SetNextItemWidth(LabeledItemWidth("Title"));
-        ImGui::InputText("Title", menuConfig.title, sizeof(menuConfig.title));
-        ImGui::SetNextItemWidth(LabeledItemWidth("FPS"));
-        ImGui::InputInt("FPS", &menuConfig.fps);
-        menuConfig.fps = std::clamp(menuConfig.fps, 1, 240);
-        ImGui::SetNextItemWidth(LabeledItemWidth("Length (s, 0 = unlimited)"));
-        ImGui::InputFloat("Length (s, 0 = unlimited)", &menuConfig.lengthSeconds, 1.0f, 10.0f, "%.0f");
-        menuConfig.lengthSeconds = std::max(menuConfig.lengthSeconds, 0.f);
-        ImGui::TextDisabled("Saved to recordings/<title>.mp4 (requires ffmpeg on PATH)");
+    ImGui::Checkbox("Record to video", &menuConfig.run.record);
+    if (menuConfig.run.record) {
+        FormRow(MenuContentWidth, "Title (optional label)");
+        ImGui::InputText("##Title (optional label)", menuConfig.run.title, sizeof(menuConfig.run.title));
+        FormRow(MenuContentWidth, "FPS");
+        ImGui::InputInt("##FPS", &menuConfig.run.fps);
+        menuConfig.run.fps = std::clamp(menuConfig.run.fps, 1, 240);
+        FormRow(MenuContentWidth, "Length (s, 0 = unlimited)");
+        ImGui::InputFloat("##Length (s, 0 = unlimited)", &menuConfig.run.lengthSeconds, 1.0f, 10.0f, "%.0f");
+        menuConfig.run.lengthSeconds = std::max(menuConfig.run.lengthSeconds, 0.f);
+        ImGui::TextDisabled("Saved to recordings/<generated name>.mp4 (requires ffmpeg on PATH)");
 
-        ImGui::Checkbox("Render as fast as possible (no live playback)", &menuConfig.batchRender);
-        if (menuConfig.batchRender)
+        ImGui::Checkbox("Render as fast as possible (no live playback)", &menuConfig.run.batchRender);
+        if (menuConfig.run.batchRender)
             ImGui::TextDisabled("Computes and saves the video directly at FPS/Length above, taking\n"
                                  "however long that takes to compute instead of that many real\n"
                                  "seconds. Cancel button (or Space) stops it early.");
-
-        // Batch-rendered video never visits Running's live "Controls" panel, so without this a
-        // batch render could only ever use the scene's plain color — set it here instead, before
-        // the video starts. Applies to a live recording too, just redundant with the panel there.
-        ImGui::Spacing();
-        DrawColorByControls(MenuContentWidth);
     }
 
     ImGui::Separator();
-    ImGui::Checkbox("Save data to CSV", &menuConfig.saveData);
-    if (menuConfig.saveData) {
-        ImGui::SetNextItemWidth(LabeledItemWidth("Data title"));
-        ImGui::InputText("Data title", menuConfig.dataTitle, sizeof(menuConfig.dataTitle));
-        ImGui::SetNextItemWidth(LabeledItemWidth("Sample rate (Hz)"));
-        ImGui::InputInt("Sample rate (Hz)", &menuConfig.dataRate);
-        menuConfig.dataRate = std::clamp(menuConfig.dataRate, 1, 240);
-        ImGui::SetNextItemWidth(LabeledItemWidth("Save length (s, 0 = unlimited)"));
-        ImGui::InputFloat("Save length (s, 0 = unlimited)", &menuConfig.dataLengthSeconds, 1.0f, 10.0f, "%.0f");
-        menuConfig.dataLengthSeconds = std::max(menuConfig.dataLengthSeconds, 0.f);
+    ImGui::Checkbox("Save data to CSV", &menuConfig.run.saveData);
+    if (menuConfig.run.saveData) {
+        FormRow(MenuContentWidth, "Data title (optional label)");
+        ImGui::InputText("##Data title (optional label)", menuConfig.run.dataTitle, sizeof(menuConfig.run.dataTitle));
+        FormRow(MenuContentWidth, "Sample rate (Hz)");
+        ImGui::InputInt("##Sample rate (Hz)", &menuConfig.run.dataRate);
+        menuConfig.run.dataRate = std::clamp(menuConfig.run.dataRate, 1, 240);
+        FormRow(MenuContentWidth, "Save length (s, 0 = unlimited)");
+        ImGui::InputFloat("##Save length (s, 0 = unlimited)", &menuConfig.run.dataLengthSeconds, 1.0f, 10.0f, "%.0f");
+        menuConfig.run.dataLengthSeconds = std::max(menuConfig.run.dataLengthSeconds, 0.f);
 
         ImGui::TextUnformatted("Fields");
-        ImGui::Checkbox("Position", &menuConfig.dataPosition);
+        ImGui::Checkbox("Position", &menuConfig.run.dataPosition);
         ImGui::SameLine();
-        ImGui::Checkbox("Velocity", &menuConfig.dataVelocity);
+        ImGui::Checkbox("Velocity", &menuConfig.run.dataVelocity);
         ImGui::SameLine();
-        ImGui::Checkbox("Speed", &menuConfig.dataSpeed);
-        ImGui::Checkbox("Density", &menuConfig.dataDensity);
+        ImGui::Checkbox("Speed", &menuConfig.run.dataSpeed);
+        ImGui::Checkbox("Density", &menuConfig.run.dataDensity);
         ImGui::SameLine();
-        ImGui::Checkbox("Pressure", &menuConfig.dataPressure);
+        ImGui::Checkbox("Pressure", &menuConfig.run.dataPressure);
 
-        ImGui::TextDisabled("Saved to data/<title>.csv (one row per particle per sample)");
+        ImGui::TextDisabled("Saved to data/<generated name>.csv (one row per particle per sample)");
     }
+
+    ImGui::Separator();
+    ImGui::Checkbox("Save channel velocity profile", &menuConfig.run.saveProfile);
+    if (menuConfig.run.saveProfile) {
+        FormRow(MenuContentWidth, "Profile title (optional label)");
+        ImGui::InputText("##Profile title (optional label)", menuConfig.run.profileTitle, sizeof(menuConfig.run.profileTitle));
+        FormRow(MenuContentWidth, "Profile rate (Hz, sim time)");
+        ImGui::InputInt("##Profile rate (Hz, sim time)", &menuConfig.run.profileRate);
+        menuConfig.run.profileRate = std::clamp(menuConfig.run.profileRate, 1, 60);
+        FormRow(MenuContentWidth, "Profile length (sim s, 0 = unlimited)");
+        ImGui::InputFloat("##Profile length (sim s, 0 = unlimited)", &menuConfig.run.profileLengthSeconds, 1.0f, 10.0f, "%.0f");
+        menuConfig.run.profileLengthSeconds = std::max(menuConfig.run.profileLengthSeconds, 0.f);
+        FormRow(MenuContentWidth, "Bins across channel (0 = one per row)");
+        ImGui::InputInt("##Bins across channel (0 = one per row)", &menuConfig.run.profileBins);
+        menuConfig.run.profileBins = std::max(menuConfig.run.profileBins, 0);
+        ImGui::TextDisabled("Saved to data/<name>_profile.csv + _frames.csv: per-bin v_x across the "
+                             "channel height, plus per-sample density/velocity stats.");
+    }
+
+    ImGui::Separator();
+    ImGui::TextUnformatted("Run Queue");
+    if (ImGui::Button("Add to Queue", ImVec2(MenuContentWidth, 0.f))) {
+        if (HasDeterministicEnd(menuConfig.run))
+            runQueue.push_back({ menuConfig.scene, menuConfig.run });
+    }
+    if (!HasDeterministicEnd(menuConfig.run))
+        ImGui::TextColored(ImVec4(1.f, 0.4f, 0.4f, 1.f),
+                            "Enable recording, data-save or profile with a nonzero length first.");
+
+    int removeIndex = -1;
+    for (int i = 0; i < static_cast<int>(runQueue.size()); i++) {
+        ImGui::PushID(i);
+        ImGui::TextDisabled("%d.", i + 1);
+        ImGui::SameLine();
+        ImGui::Text("%s (%dx%d)%s%s%s", runQueue[i].scene.name.c_str(),
+                    runQueue[i].scene.spawn.gridCountX, runQueue[i].scene.spawn.gridCountY,
+                    runQueue[i].run.record      ? " [video]"   : "",
+                    runQueue[i].run.saveData    ? " [data]"    : "",
+                    runQueue[i].run.saveProfile ? " [profile]" : "");
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Remove")) removeIndex = i;
+        ImGui::PopID();
+    }
+    if (removeIndex >= 0) runQueue.erase(runQueue.begin() + removeIndex);
+
+    ImGui::BeginDisabled(runQueue.empty());
+    if (ImGui::Button("Run Queue", ImVec2(MenuContentWidth, 0.f))) StartQueue();
+    ImGui::EndDisabled();
 
     ImGui::Separator();
     if (ImGui::Button("Start Simulation", ImVec2(MenuContentWidth, 0.f)))
@@ -468,14 +1002,39 @@ static void DrawRenderingOverlay() {
     ImGui::SetNextWindowBgAlpha(0.9f);
     ImGui::Begin("Rendering", nullptr, ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoCollapse);
 
-    ImGui::TextUnformatted(ActiveScene.name);
-    const float recorded = app.RecordedSeconds();
-    if (menuConfig.lengthSeconds > 0.f) {
-        ImGui::Text("%.1f / %.1f seconds rendered", recorded, menuConfig.lengthSeconds);
-        const float frac = std::clamp(recorded / menuConfig.lengthSeconds, 0.f, 1.f);
-        ImGui::ProgressBar(frac, ImVec2(260.f, 0.f));
-    } else {
-        ImGui::Text("%.1f seconds rendered (unlimited length)", recorded);
+    ImGui::TextUnformatted(ActiveScene.name.c_str());
+    if (queueRunningIndex >= 0)
+        ImGui::Text("Queue: %d / %d", queueRunningIndex + 1, static_cast<int>(runQueue.size()));
+
+    // A data-only queue entry (no video) never sets app.IsRecording() — track its own elapsed
+    // time via the data-save sample count instead, same source DrawRunningOverlay's "DATA %.1fs"
+    // indicator uses, so this progress display has something meaningful to show either way.
+    if (app.IsRecording()) {
+        const float recorded = app.RecordedSeconds();
+        if (activeRun.lengthSeconds > 0.f) {
+            ImGui::Text("%.1f / %.1f seconds rendered", recorded, activeRun.lengthSeconds);
+            const float frac = std::clamp(recorded / activeRun.lengthSeconds, 0.f, 1.f);
+            ImGui::ProgressBar(frac, ImVec2(260.f, 0.f));
+        } else {
+            ImGui::Text("%.1f seconds rendered (unlimited length)", recorded);
+        }
+    } else if (dataRecorder.IsActive()) {
+        const float dataSeconds = dataRateActive > 0 ? static_cast<float>(dataSavedFrames) / dataRateActive : 0.f;
+        if (activeRun.dataLengthSeconds > 0.f) {
+            ImGui::Text("%.1f / %.1f seconds sampled", dataSeconds, activeRun.dataLengthSeconds);
+            const float frac = std::clamp(dataSeconds / activeRun.dataLengthSeconds, 0.f, 1.f);
+            ImGui::ProgressBar(frac, ImVec2(260.f, 0.f));
+        } else {
+            ImGui::Text("%.1f seconds sampled (unlimited length)", dataSeconds);
+        }
+    } else if (profileLogger.IsActive()) {
+        const float t = static_cast<float>(simTime);
+        if (activeRun.profileLengthSeconds > 0.f) {
+            ImGui::Text("%.1f / %.1f sim seconds profiled", t, activeRun.profileLengthSeconds);
+            ImGui::ProgressBar(std::clamp(t / activeRun.profileLengthSeconds, 0.f, 1.f), ImVec2(260.f, 0.f));
+        } else {
+            ImGui::Text("%.1f sim seconds profiled (unlimited length)", t);
+        }
     }
     ImGui::TextDisabled("Rendering as fast as possible, straight to video —\nno live playback follows.");
 
@@ -497,7 +1056,7 @@ static void DrawRunningOverlay() {
     // computations below (button/combo alignment) have a stable width to work from.
     constexpr float ContentWidth = 240.f;
 
-    ImGui::TextUnformatted(ActiveScene.name);
+    ImGui::TextUnformatted(ActiveScene.name.c_str());
     if (app.IsRecording()) {
         ImGui::SameLine();
         ImGui::TextColored(ImVec4(1.0f, 0.3f, 0.3f, 1.0f), "REC %.1fs", app.RecordedSeconds());
@@ -506,6 +1065,10 @@ static void DrawRunningOverlay() {
         ImGui::SameLine();
         const float dataSeconds = dataRateActive > 0 ? static_cast<float>(dataSavedFrames) / dataRateActive : 0.f;
         ImGui::TextColored(ImVec4(0.3f, 0.6f, 1.0f, 1.0f), "DATA %.1fs", dataSeconds);
+    }
+    if (profileLogger.IsActive()) {
+        ImGui::SameLine();
+        ImGui::TextColored(ImVec4(0.3f, 0.9f, 0.5f, 1.0f), "PROFILE %.1fs", static_cast<float>(simTime));
     }
     if (paused) {
         ImGui::SameLine();
@@ -553,9 +1116,16 @@ void RemoveObject(size_t i) {
 // The simulation container's half-extents — the active scene's boundary fractions applied to the
 // recording's own resolution while one is active (so the boundary/wall-bounce geometry can't
 // drift out from under a captured video frame that's pinned to a fixed size — see
-// VulkanContext::RecordingHalfWidth/Height), or the live window size otherwise.
-float ScreenHalfWidth()  { return app.RecordingHalfWidth()  * ActiveScene.boundary.widthFrac; }
-float ScreenHalfHeight() { return app.RecordingHalfHeight() * ActiveScene.boundary.heightFrac; }
+// VulkanContext::RecordingHalfWidth/Height), or the live window size otherwise. A scene that sets
+// SceneBoundary::halfWidthPx/halfHeightPx gets that exact size instead, independent of both.
+float ScreenHalfWidth() {
+    const auto& b = ActiveScene.boundary;
+    return b.halfWidthPx > 0.f ? b.halfWidthPx : app.RecordingHalfWidth() * b.widthFrac;
+}
+float ScreenHalfHeight() {
+    const auto& b = ActiveScene.boundary;
+    return b.halfHeightPx > 0.f ? b.halfHeightPx : app.RecordingHalfHeight() * b.heightFrac;
+}
 
 // Draws a black frame at the active scene's boundary, so a container narrower than the window
 // (see SceneBoundary) reads as a wall instead of an invisible line partway across the screen.
@@ -728,23 +1298,39 @@ static void DrawAndSubmitFrame(float dt, bool offscreen) {
 // window responsive during a long render instead of hanging; the caller separately refreshes the
 // on-screen progress overlay once per real tick (a plain, cheap swapchain present, decoupled from
 // this loop's own pace) rather than this loop touching the swapchain itself.
+// True while the active run still has an output driving the batch loop — a data-only queue entry
+// (no video) never sets app.IsRecording(), so the loop needs both checked to know it's still going.
+static bool BatchRunActive() { return app.IsRecording() || dataRecorder.IsActive() || profileLogger.IsActive(); }
+
 static void AdvanceRendering() {
     using Clock = std::chrono::steady_clock;
     const auto  budgetStart            = Clock::now();
     constexpr float FrameBudgetSeconds = 1.f / 30.f;
-    const float frameDt = 1.f / static_cast<float>(std::max(menuConfig.fps, 1));
+    const float frameDt = 1.f / static_cast<float>(std::max(activeRun.fps, 1));
 
-    while (app.IsRecording()) {
+    while (BatchRunActive()) {
         AdvanceSimulation(frameDt);
         DrawAndSubmitFrame(frameDt, /*offscreen=*/true);
         if (std::chrono::duration<float>(Clock::now() - budgetStart).count() >= FrameBudgetSeconds)
             break;
     }
 
-    if (!app.IsRecording()) ReturnToMenu(); // StopRecording() here is a no-op, already stopped itself
+    // StopRecording()/dataRecorder.Stop() here are no-ops if the output already stopped itself on
+    // reaching its own length cap — this just handles whichever one (or both) just finished.
+    if (!BatchRunActive()) {
+        if (queueRunningIndex >= 0) AdvanceQueue();
+        else                        ReturnToMenu();
+    }
 }
 
 int main(int, char**) {
+    // Assigned here, not via a default member initializer on MenuConfig — menuConfig (this TU)
+    // and ScenePresets (Scene.cpp) are globals in different translation units with unspecified
+    // relative init order, so reading ScenePresets[0] from a static initializer would be a real
+    // hazard. By main()'s first line every global constructor has already run.
+    menuConfig.scene = ScenePresets[0];
+    RefreshUserPresets();
+
     app.Init(Config::WindowTitle, Config::WindowWidth, Config::WindowHeight);
     app.SetUICallback([]() {
         switch (appState) {

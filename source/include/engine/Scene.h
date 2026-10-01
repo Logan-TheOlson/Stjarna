@@ -1,6 +1,7 @@
 #pragma once
 #include "Config.h"
 #include "util/Vector.h"
+#include <string>
 #include <vector>
 
 // Simulation container half-extents, as a fraction of the window's half-extents (1.0 = walls at
@@ -8,6 +9,13 @@
 struct SceneBoundary {
     float widthFrac  = 1.0f;
     float heightFrac = 1.0f;
+    // Absolute half-extents in simulation pixels. When > 0, each overrides its *Frac above, so
+    // the container no longer depends on the window size or on whether a recording (with its own
+    // fixed resolution) is active. Scenes whose geometry is part of the physics — e.g. the
+    // Poiseuille channel height H, which sets the analytic profile — size the box from their own
+    // particle grid this way instead of from a window fraction.
+    float halfWidthPx  = 0.f;
+    float halfHeightPx = 0.f;
     // If set, the left/right walls don't bounce particles — a particle crossing one teleports to
     // the other side instead (position only; velocity untouched), simulating an infinite domain
     // for a channel-flow test. main.cpp mirrors real particles across the seam too (see
@@ -62,6 +70,18 @@ enum class EosModel {
     Polytropic,
 };
 
+// Which viscous force main.cpp's CalculatePressureForce applies between particle pairs.
+enum class ViscosityModel {
+    // Monaghan artificial viscosity: a pressure-like term along the pair axis, active only for
+    // approaching pairs, strength set by `viscosity` (alpha) and `viscosityQuadratic` (beta).
+    // Its effective kinematic viscosity (~alpha*h*c/8 in 2D) is not an input — it has to be
+    // measured, and it scales with h.
+    Monaghan,
+    // Morris, Fox & Zhu (1997) physical viscosity: a discretised nu * laplacian(v) acting on the
+    // full relative velocity of every pair, with nu = `kinematicViscosity` set directly.
+    Morris,
+};
+
 struct SceneParticles {
     float circleRadius = 3.0f;
     Color circleColor  = { 0.2f, 0.6f, 1.0f, 1.0f };
@@ -81,10 +101,14 @@ struct SceneParticles {
     int      exponent        = 7;         // WCSPH only
     float    polytropicIndex = 1.f / 6.f; // Polytropic only; gamma = 1 + 1/polytropicIndex
 
-    float viscosity          = 0.5f;
+    ViscosityModel viscosityModel = ViscosityModel::Monaghan;
+
+    float viscosity          = 0.5f;  // Monaghan only (alpha)
     // Monaghan artificial viscosity quadratic-term coefficient (beta) — see main.cpp's
-    // CalculatePressureForce for why this must stay well under 1.
+    // CalculatePressureForce for why this must stay well under 1. Monaghan only.
     float viscosityQuadratic = 0.05f;
+    // Kinematic viscosity nu in px^2/s. Morris only.
+    float kinematicViscosity = 800.f;
 };
 
 // How Init() lays out the starting particles: a gridCountX x gridCountY block (or, if `circular`,
@@ -98,8 +122,11 @@ struct SceneSpawn {
 };
 
 struct Scene {
-    const char*     name;
-    const char*     description;
+    // Owned (not a pointer into a string literal) so a preset loaded from disk at runtime
+    // (ScenePresetIO) can populate these safely — only the 3 compiled presets get away with a
+    // literal today, but a loaded Scene needs storage of its own.
+    std::string     name;
+    std::string     description;
     SceneBoundary   boundary;
     ScenePhysics    physics;
     SceneGravity    gravity;
