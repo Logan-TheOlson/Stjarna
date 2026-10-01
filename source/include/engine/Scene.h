@@ -121,6 +121,24 @@ struct SceneSpawn {
     bool  circular     = false;
 };
 
+// A sudden acceleration applied to every particle inside an area. Circle/Rect pick the area's
+// shape; Continuous applies `accel` (px/s^2) every substep while the event is active, Once adds
+// `accel` (px/s) to the velocity of everything inside, a single time, when startTime is reached.
+enum class EventShape { Circle, Rect };
+enum class EventMode  { Continuous, Once };
+
+struct SceneEvent {
+    EventShape shape = EventShape::Circle;
+    EventMode  mode  = EventMode::Once;
+    // Area center in world pixels (origin = window center, +y up).
+    float cx = 0.f, cy = 0.f;
+    float radius = 100.f;                // Circle
+    float halfW = 100.f, halfH = 100.f;  // Rect
+    Vec2  accel = Vec2(0.f, 0.f);        // Continuous: px/s^2.  Once: px/s velocity delta.
+    float startTime = 0.f;               // simulated seconds since the run started
+    float duration  = 0.f;               // Continuous only; 0 = until the run ends
+};
+
 struct Scene {
     // Owned (not a pointer into a string literal) so a preset loaded from disk at runtime
     // (ScenePresetIO) can populate these safely — only the 3 compiled presets get away with a
@@ -139,6 +157,8 @@ struct Scene {
     // default count), since BuildScene() only overrides the latter.
     int             realTimeLimitX = 0;
     int             realTimeLimitY = 0;
+
+    std::vector<SceneEvent> events;
 };
 
 extern const std::vector<Scene> ScenePresets;

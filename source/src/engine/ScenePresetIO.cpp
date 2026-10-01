@@ -161,8 +161,69 @@ const std::vector<PresetField>& Fields() {
                                 [](Scene& s, const std::string& v) { s.spawn.offsetXFrac = ParseFloat(v, s.spawn.offsetXFrac); } },
         { "spawn.circular",    [](const Scene& s) { return FormatBool(s.spawn.circular); },
                                 [](Scene& s, const std::string& v) { s.spawn.circular = ParseBool(v, s.spawn.circular); } },
+
+        { "realTimeLimitX", [](const Scene& s) { return std::to_string(s.realTimeLimitX); },
+                             [](Scene& s, const std::string& v) { s.realTimeLimitX = ParseInt(v, s.realTimeLimitX); } },
+        { "realTimeLimitY", [](const Scene& s) { return std::to_string(s.realTimeLimitY); },
+                             [](Scene& s, const std::string& v) { s.realTimeLimitY = ParseInt(v, s.realTimeLimitY); } },
     };
     return fields;
+}
+
+// Events are a list, so they don't fit the one-key-per-Scene-field table above: written as
+// "event.count=N" plus "event.<i>.<field>=value" lines instead.
+struct EventField {
+    const char*                                          key;
+    std::function<std::string(const SceneEvent&)>        get;
+    std::function<void(SceneEvent&, const std::string&)> set;
+};
+
+const std::vector<EventField>& EventFields() {
+    static const std::vector<EventField> fields = {
+        { "shape",     [](const SceneEvent& e) { return std::string(e.shape == EventShape::Rect ? "Rect" : "Circle"); },
+                        [](SceneEvent& e, const std::string& v) { if (v == "Rect") e.shape = EventShape::Rect; else if (v == "Circle") e.shape = EventShape::Circle; } },
+        { "mode",      [](const SceneEvent& e) { return std::string(e.mode == EventMode::Continuous ? "Continuous" : "Once"); },
+                        [](SceneEvent& e, const std::string& v) { if (v == "Continuous") e.mode = EventMode::Continuous; else if (v == "Once") e.mode = EventMode::Once; } },
+        { "cx",        [](const SceneEvent& e) { return FormatFloat(e.cx); },
+                        [](SceneEvent& e, const std::string& v) { e.cx = ParseFloat(v, e.cx); } },
+        { "cy",        [](const SceneEvent& e) { return FormatFloat(e.cy); },
+                        [](SceneEvent& e, const std::string& v) { e.cy = ParseFloat(v, e.cy); } },
+        { "radius",    [](const SceneEvent& e) { return FormatFloat(e.radius); },
+                        [](SceneEvent& e, const std::string& v) { e.radius = ParseFloat(v, e.radius); } },
+        { "halfW",     [](const SceneEvent& e) { return FormatFloat(e.halfW); },
+                        [](SceneEvent& e, const std::string& v) { e.halfW = ParseFloat(v, e.halfW); } },
+        { "halfH",     [](const SceneEvent& e) { return FormatFloat(e.halfH); },
+                        [](SceneEvent& e, const std::string& v) { e.halfH = ParseFloat(v, e.halfH); } },
+        { "ax",        [](const SceneEvent& e) { return FormatFloat(e.accel.x); },
+                        [](SceneEvent& e, const std::string& v) { e.accel.x = ParseFloat(v, e.accel.x); } },
+        { "ay",        [](const SceneEvent& e) { return FormatFloat(e.accel.y); },
+                        [](SceneEvent& e, const std::string& v) { e.accel.y = ParseFloat(v, e.accel.y); } },
+        { "startTime", [](const SceneEvent& e) { return FormatFloat(e.startTime); },
+                        [](SceneEvent& e, const std::string& v) { e.startTime = ParseFloat(v, e.startTime); } },
+        { "duration",  [](const SceneEvent& e) { return FormatFloat(e.duration); },
+                        [](SceneEvent& e, const std::string& v) { e.duration = ParseFloat(v, e.duration); } },
+    };
+    return fields;
+}
+
+// Handles one "event.*" line; returns false if `key` isn't an event key at all.
+bool LoadEventKey(Scene& out, const std::string& key, const std::string& value) {
+    if (key.rfind("event.", 0) != 0) return false;
+    const std::string rest = key.substr(6);
+    if (rest == "count") {
+        const int n = std::clamp(ParseInt(value, 0), 0, 1024);
+        out.events.resize(static_cast<size_t>(n));
+        return true;
+    }
+    const size_t dot = rest.find('.');
+    if (dot == std::string::npos) return false;
+    const int idx = ParseInt(rest.substr(0, dot), -1);
+    if (idx < 0 || idx >= 1024) return true; // malformed index: swallow rather than warn per line
+    if (static_cast<size_t>(idx) >= out.events.size()) out.events.resize(static_cast<size_t>(idx) + 1);
+    const std::string field = rest.substr(dot + 1);
+    for (const auto& f : EventFields())
+        if (field == f.key) { f.set(out.events[static_cast<size_t>(idx)], value); return true; }
+    return false;
 }
 
 } // namespace
@@ -172,6 +233,10 @@ bool SaveScenePreset(const std::filesystem::path& path, const Scene& scene) {
     if (!out) return false;
     for (const auto& field : Fields())
         out << field.key << '=' << field.get(scene) << '\n';
+    out << "event.count=" << scene.events.size() << '\n';
+    for (size_t i = 0; i < scene.events.size(); i++)
+        for (const auto& f : EventFields())
+            out << "event." << i << '.' << f.key << '=' << f.get(scene.events[i]) << '\n';
     return true;
 }
 
@@ -191,7 +256,7 @@ bool LoadScenePreset(const std::filesystem::path& path, Scene& out) {
             [&](const PresetField& f) { return key == f.key; });
         if (it != fields.end())
             it->set(out, value);
-        else
+        else if (!LoadEventKey(out, key, value))
             std::cerr << "LoadScenePreset: unknown key '" << key << "' in " << path << ", skipping\n";
     }
     return true;

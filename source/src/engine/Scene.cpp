@@ -96,6 +96,34 @@ namespace {
         return s;
     }
 
+    // A container completely packed with fluid and no forces at all (no gravity, no external
+    // force): nothing happens until an event (see SceneEvent) kicks part of it. Sized from the
+    // particle grid like Poiseuille so the lattice fills the box wall to wall.
+    Scene MakeEventBox(int gridCountX = 100, int gridCountY = 60) {
+        Scene s = MakeOpenTank(gridCountX, gridCountY);
+        s.name        = "Event Box";
+        s.description = "A box completely packed with fluid and no gravity; scheduled or live "
+                         "events push particles inside an area.";
+        s.physics.force = Vec2(0.f, 0.f);
+        const float spacing = s.particles.circleRadius * 3.0f; // must match Init()'s spacing
+        s.boundary.halfWidthPx  = 0.5f * static_cast<float>(gridCountX) * spacing;
+        s.boundary.halfHeightPx = 0.5f * static_cast<float>(gridCountY) * spacing;
+        // Same lattice-sum rest density as Poiseuille (spacing 9, h = 15), so the packed block
+        // starts at rest instead of over-compressed.
+        s.particles.targetDensity = 1.20895e-2f;
+        s.realTimeLimitX = 100;
+        s.realTimeLimitY = 60;
+
+        SceneEvent kick;
+        kick.shape     = EventShape::Circle;
+        kick.mode      = EventMode::Once;
+        kick.radius    = 80.f;
+        kick.accel     = Vec2(400.f, 0.f);
+        kick.startTime = 1.f;
+        s.events.push_back(kick);
+        return s;
+    }
+
     // No external force at all — the only thing holding the block together (or pulling it apart)
     // is mutual N-body attraction between particles, via the genuine-2D treecode, plus SPH
     // pressure resisting the collapse. Default window boundaries (full-window box, free-slip
@@ -229,7 +257,7 @@ namespace {
 }
 
 const std::vector<Scene> ScenePresets = {
-    MakeOpenTank(), MakePoiseuille(), MakeSelfGravity(),
+    MakeOpenTank(), MakePoiseuille(), MakeSelfGravity(), MakeEventBox(),
 };
 
 Scene BuildScene(int presetIndex, int gridCountX, int gridCountY) {
@@ -239,6 +267,7 @@ Scene BuildScene(int presetIndex, int gridCountX, int gridCountY) {
         case 0:  return MakeOpenTank(gridCountX, gridCountY);
         case 1:  return MakePoiseuille(gridCountX, gridCountY);
         case 2:  return MakeSelfGravity(gridCountX, gridCountY);
+        case 3:  return MakeEventBox(gridCountX, gridCountY);
         default: return ScenePresets[presetIndex];
     }
 }

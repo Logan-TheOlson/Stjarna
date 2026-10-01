@@ -542,9 +542,125 @@ static void DrawParticlesSection(SceneParticles& pr, float contentWidth) {
 // call it despite living earlier in the file, next to the other pause/step/menu logic.
 static void Integrate(float subDt);
 
+// ---- Events (see SceneEvent) -------------------------------------------------------------------
+static bool       showEventAreas     = true;  // draw event areas over the live view (never when recording)
+static bool       placeEventArmed    = false; // Running overlay: next sim-view click creates an event
+static SceneEvent placeEventTemplate = [] { SceneEvent e; e.accel = Vec2(400.f, 0.f); return e; }();
+// Whether each ActiveScene.events[i] of mode Once has already fired this run. Kept parallel to the
+// live list (the live editor inserts/erases in step) and reset by ResetSimulation.
+static std::vector<char> eventFired;
+
+static bool InsideEvent(const SceneEvent& e, const Vec2& p) {
+    const float dx = p.x - e.cx, dy = p.y - e.cy;
+    if (e.shape == EventShape::Circle) return dx * dx + dy * dy <= e.radius * e.radius;
+    return std::fabs(dx) <= e.halfW && std::fabs(dy) <= e.halfH;
+}
+
+// Adds each due Once event's velocity delta to every particle inside its area — once per run.
+static void ApplyOnceEvents() {
+    const auto& events = ActiveScene.events;
+    eventFired.resize(events.size(), 0);
+    for (size_t i = 0; i < events.size(); i++) {
+        const SceneEvent& e = events[i];
+        if (e.mode != EventMode::Once || eventFired[i] || simTime < e.startTime) continue;
+        eventFired[i] = 1;
+        for (auto& obj : objects)
+            if (InsideEvent(e, obj.pos)) obj.vel += e.accel;
+    }
+}
+
+// Applies every Continuous event active at sim time `t` as an acceleration over `subDt`. Goes
+// straight onto vel (not acc) because acc is only zeroed/recomputed every forceInterval substeps.
+static void ApplyContinuousEvents(double t, float subDt) {
+    for (const SceneEvent& e : ActiveScene.events) {
+        if (e.mode != EventMode::Continuous || t < e.startTime) continue;
+        if (e.duration > 0.f && t >= static_cast<double>(e.startTime) + e.duration) continue;
+        const Vec2 dv = e.accel * subDt;
+        for (auto& obj : objects)
+            if (InsideEvent(e, obj.pos)) obj.vel += dv;
+    }
+}
+
+static const char* EventShapeNames[] = { "Circle", "Rect" };
+static const char* EventModeNames[]  = { "Continuous (acceleration)", "Once (velocity kick)" };
+
+static void DrawEventFields(SceneEvent& e, float contentWidth) {
+    int shape = static_cast<int>(e.shape), mode = static_cast<int>(e.mode);
+    FormRow(contentWidth, "Shape");
+    if (ImGui::Combo("##Shape", &shape, EventShapeNames, 2)) e.shape = static_cast<EventShape>(shape);
+    FormRow(contentWidth, "Mode");
+    if (ImGui::Combo("##Mode", &mode, EventModeNames, 2)) e.mode = static_cast<EventMode>(mode);
+
+    FormRow(contentWidth, "Center X (px)");
+    ImGui::InputFloat("##Center X (px)", &e.cx);
+    FormRow(contentWidth, "Center Y (px)");
+    ImGui::InputFloat("##Center Y (px)", &e.cy);
+    if (e.shape == EventShape::Circle) {
+        FormRow(contentWidth, "Radius (px)");
+        ImGui::InputFloat("##Radius (px)", &e.radius);
+        e.radius = std::max(e.radius, 0.f);
+    } else {
+        FormRow(contentWidth, "Half-width (px)");
+        ImGui::InputFloat("##Half-width (px)", &e.halfW);
+        FormRow(contentWidth, "Half-height (px)");
+        ImGui::InputFloat("##Half-height (px)", &e.halfH);
+        e.halfW = std::max(e.halfW, 0.f);
+        e.halfH = std::max(e.halfH, 0.f);
+    }
+
+    const bool once = e.mode == EventMode::Once;
+    FormRow(contentWidth, once ? "Velocity kick X (px/s)" : "Accel X (px/s^2)");
+    ImGui::InputFloat("##Event X", &e.accel.x);
+    FormRow(contentWidth, once ? "Velocity kick Y (px/s)" : "Accel Y (px/s^2)");
+    ImGui::InputFloat("##Event Y", &e.accel.y);
+    FormRow(contentWidth, "Start time (s)");
+    ImGui::InputFloat("##Start time (s)", &e.startTime);
+    e.startTime = std::max(e.startTime, 0.f);
+    if (!once) {
+        FormRow(contentWidth, "Duration (s, 0 = unlimited)");
+        ImGui::InputFloat("##Duration (s, 0 = unlimited)", &e.duration);
+        e.duration = std::max(e.duration, 0.f);
+    }
+}
+
+// Editable list of events. `live` edits ActiveScene.events mid-run (adds a "Fire now" button and
+// keeps eventFired in step); otherwise it edits a menu scene's list before a run starts.
+static void DrawEventsEditor(std::vector<SceneEvent>& events, float contentWidth, bool live) {
+    int removeIdx = -1;
+    for (size_t i = 0; i < events.size(); i++) {
+        ImGui::PushID(static_cast<int>(i));
+        SceneEvent& e = events[i];
+        char header[64];
+        std::snprintf(header, sizeof(header), "Event %d: %s, %s###hdr", static_cast<int>(i) + 1,
+                      EventShapeNames[static_cast<int>(e.shape)], e.mode == EventMode::Once ? "once" : "continuous");
+        if (ImGui::CollapsingHeader(header)) {
+            DrawEventFields(e, contentWidth);
+            if (live && ImGui::Button("Fire now")) {
+                e.startTime = static_cast<float>(simTime);
+                if (i < eventFired.size()) eventFired[i] = 0;
+            }
+            if (live) ImGui::SameLine();
+            if (ImGui::Button("Delete")) removeIdx = static_cast<int>(i);
+        }
+        ImGui::PopID();
+    }
+    if (removeIdx >= 0) {
+        events.erase(events.begin() + removeIdx);
+        if (live && static_cast<size_t>(removeIdx) < eventFired.size())
+            eventFired.erase(eventFired.begin() + removeIdx);
+    }
+    if (ImGui::Button("Add event", ImVec2(contentWidth, 0.f))) {
+        SceneEvent e;
+        if (live) e.startTime = static_cast<float>(simTime);
+        events.push_back(e);
+        if (live) eventFired.resize(events.size(), 0);
+    }
+}
+
 static void ResetSimulation() {
     objects.clear();
     Init();
+    eventFired.assign(ActiveScene.events.size(), 0);
     runIndex++;
     paused = false;
     cameraOffsetX = 0.f;
@@ -564,16 +680,21 @@ static void AdvanceSimulation(float dt) {
     // see Integrate()'s comment for why a stale force is a real energy-gain source, and why
     // recomputing every substep was too expensive at this particle count.
     const float subDt = dt / static_cast<float>(physics.substeps);
+    ApplyOnceEvents();
     for (int step = 0; step < physics.substeps; step++) {
         if (step % physics.forceInterval == 0) {
             for (auto& obj : objects) obj.acc = Vec2(0.0f, 0.0f);
             Update(subDt);
         }
+        ApplyContinuousEvents(simTime + static_cast<double>(step) * subDt, subDt);
         Integrate(subDt);
     }
 
     simTime += dt;
-    if (profileLogger.IsActive() && simTime + 1e-6 >= profileLogger.NextSampleTime())
+    // A loop, not an if: dt can span several sample periods when the profile rate exceeds the step
+    // rate (e.g. 60 Hz profile at a 30 fps batch render), and one sample per call would let the
+    // frame counter fall behind the time column.
+    while (profileLogger.IsActive() && simTime + 1e-6 >= profileLogger.NextSampleTime())
         profileLogger.Sample();
 }
 
@@ -603,10 +724,13 @@ static int  queueRunningIndex = -1; // -1 = no queue run in progress; runQueue i
 // A queued entry needs some condition that will actually end its batch run on its own, or the
 // queue would stall forever on it — checked at "Add to Queue" time (see DrawMenu's Run Queue
 // section).
+// Every enabled output must be finite (and at least one enabled): AdvanceRendering runs until
+// *all* outputs have stopped, so a single unlimited one would keep the queue stuck on this entry.
 static bool HasDeterministicEnd(const RunSettings& run) {
-    return (run.record      && run.lengthSeconds        > 0.f) ||
-           (run.saveData    && run.dataLengthSeconds    > 0.f) ||
-           (run.saveProfile && run.profileLengthSeconds > 0.f);
+    if (!run.record && !run.saveData && !run.saveProfile) return false;
+    return (!run.record      || run.lengthSeconds        > 0.f) &&
+           (!run.saveData    || run.dataLengthSeconds    > 0.f) &&
+           (!run.saveProfile || run.profileLengthSeconds > 0.f);
 }
 
 static void AdvanceQueue();
@@ -639,6 +763,9 @@ static void StartRun(const Scene& scene, const RunSettings& run, bool forceBatch
     if (run.record) {
         std::string name = runBase;
         if (std::strlen(run.title) > 0) name += "_" + SanitizeFilename(run.title, "");
+        // Sanitized here too (StartRecording does it again, idempotently) so the existence check
+        // below looks at the exact path that will be written, e.g. when %g put a '+' in the name.
+        name = SanitizeFilename(name, "capture");
         name = RunNaming::EnsureUniqueBaseName(name, { { ExecutableDir() / "recordings", ".mp4" } });
         recording = app.StartRecording(name, run.fps, run.lengthSeconds);
     }
@@ -829,6 +956,7 @@ static void DrawMenu() {
     // CollapsingHeader sections below.
     static int lastSyncedSceneIndex = -1;
     if (menuConfig.sceneIndex != lastSyncedSceneIndex) {
+        bool loadedOk = true;
         if (CombinedIsBuiltin(menuConfig.sceneIndex)) {
             const Scene& preset = ScenePresets[menuConfig.sceneIndex];
             menuConfig.scene = BuildScene(menuConfig.sceneIndex, preset.spawn.gridCountX, preset.spawn.gridCountY);
@@ -836,12 +964,44 @@ static void DrawMenu() {
             Scene loaded;
             if (LoadScenePreset(userPresets[menuConfig.sceneIndex - static_cast<int>(ScenePresets.size())].path, loaded))
                 menuConfig.scene = loaded;
+            else
+                loadedOk = false;
         }
-        lastSyncedSceneIndex = menuConfig.sceneIndex;
+        if (loadedOk) {
+            lastSyncedSceneIndex = menuConfig.sceneIndex;
+        } else {
+            // The preset file is gone/unreadable: fall back to the first built-in and rescan so
+            // the combo and the scene fields agree again instead of showing the dead selection.
+            RefreshUserPresets();
+            menuConfig.sceneIndex = 0;
+            menuConfig.scene = BuildScene(0, ScenePresets[0].spawn.gridCountX, ScenePresets[0].spawn.gridCountY);
+            lastSyncedSceneIndex = 0;
+        }
     } else if (gridXEdited || gridYEdited) {
-        menuConfig.scene = CombinedIsBuiltin(menuConfig.sceneIndex)
-            ? BuildScene(menuConfig.sceneIndex, gridX, gridY)
-            : BuildSceneFromPreset(userPresets[menuConfig.sceneIndex - static_cast<int>(ScenePresets.size())], gridX, gridY);
+        // Only the fields that actually depend on the grid count are updated, so hand edits to
+        // everything else (stiffness, gravity, boundary, name, ...) survive a grid resize. For a
+        // built-in, "depends on the grid count" is found by diffing the factory scene at the old
+        // count against the one at the new count; a user preset has no recalibration formula, so
+        // only the count itself changes.
+        Scene& cur = menuConfig.scene;
+        if (CombinedIsBuiltin(menuConfig.sceneIndex)) {
+            const Scene oldDefault = BuildScene(menuConfig.sceneIndex, cur.spawn.gridCountX, cur.spawn.gridCountY);
+            const Scene newDefault = BuildScene(menuConfig.sceneIndex, gridX, gridY);
+            auto follow = [](auto& dst, const auto& oldV, const auto& newV) { if (oldV != newV) dst = newV; };
+            follow(cur.boundary.halfWidthPx,       oldDefault.boundary.halfWidthPx,       newDefault.boundary.halfWidthPx);
+            follow(cur.boundary.halfHeightPx,      oldDefault.boundary.halfHeightPx,      newDefault.boundary.halfHeightPx);
+            follow(cur.physics.force.x,            oldDefault.physics.force.x,            newDefault.physics.force.x);
+            follow(cur.physics.force.y,            oldDefault.physics.force.y,            newDefault.physics.force.y);
+            follow(cur.physics.substeps,           oldDefault.physics.substeps,           newDefault.physics.substeps);
+            follow(cur.gravity.particleMass,       oldDefault.gravity.particleMass,       newDefault.gravity.particleMass);
+            follow(cur.gravity.softening,          oldDefault.gravity.softening,          newDefault.gravity.softening);
+            follow(cur.particles.circleRadius,     oldDefault.particles.circleRadius,     newDefault.particles.circleRadius);
+            follow(cur.particles.smoothingRadius,  oldDefault.particles.smoothingRadius,  newDefault.particles.smoothingRadius);
+            follow(cur.particles.targetDensity,    oldDefault.particles.targetDensity,    newDefault.particles.targetDensity);
+            follow(cur.particles.stiffness,        oldDefault.particles.stiffness,        newDefault.particles.stiffness);
+        }
+        cur.spawn.gridCountX = gridX;
+        cur.spawn.gridCountY = gridY;
     }
 
     ImGui::Checkbox("Circular spawn", &menuConfig.scene.spawn.circular);
@@ -854,6 +1014,7 @@ static void DrawMenu() {
     if (ImGui::CollapsingHeader("Physics"))         DrawPhysicsSection(menuConfig.scene.physics, MenuContentWidth);
     if (ImGui::CollapsingHeader("Gravity"))         DrawGravitySection(menuConfig.scene.gravity, MenuContentWidth);
     if (ImGui::CollapsingHeader("Particles / EOS")) DrawParticlesSection(menuConfig.scene.particles, MenuContentWidth);
+    if (ImGui::CollapsingHeader("Events"))          DrawEventsEditor(menuConfig.scene.events, MenuContentWidth, /*live=*/false);
 
     // Always visible (not nested under "Record to video") so velocity/density gradient coloring
     // can be set up before a run starts regardless of whether it's being recorded — previously
@@ -870,9 +1031,25 @@ static void DrawMenu() {
             std::error_code ec;
             std::filesystem::create_directories(dir, ec);
             if (!ec) {
-                const std::string safeName = SanitizeFilename(presetSaveName, "preset");
+                std::string safeName = SanitizeFilename(presetSaveName, "preset");
+                std::string displayName = presetSaveName;
+                // Re-saving over the preset currently selected is an intentional in-place update;
+                // anything else that would land on an existing file gets a numeric suffix instead
+                // of silently clobbering it.
+                const bool selectedIsUser = !CombinedIsBuiltin(menuConfig.sceneIndex) &&
+                    menuConfig.sceneIndex - static_cast<int>(ScenePresets.size()) < static_cast<int>(userPresets.size());
+                const bool overwritingSelected = selectedIsUser &&
+                    userPresets[menuConfig.sceneIndex - static_cast<int>(ScenePresets.size())].path ==
+                        dir / (safeName + ".scenepreset");
+                if (!overwritingSelected) {
+                    const std::string unique = RunNaming::EnsureUniqueBaseName(safeName, { { dir, ".scenepreset" } });
+                    if (unique != safeName) {
+                        displayName += unique.substr(safeName.size()); // the "_2", "_3" ... suffix
+                        safeName = unique;
+                    }
+                }
                 const auto presetPath = dir / (safeName + ".scenepreset");
-                menuConfig.scene.name = presetSaveName;
+                menuConfig.scene.name = displayName;
                 SaveScenePreset(presetPath, menuConfig.scene);
                 RefreshUserPresets();
 
@@ -1100,7 +1277,35 @@ static void DrawRunningOverlay() {
 
     DrawColorByControls(ContentWidth);
 
+    ImGui::Spacing();
+    ImGui::Separator();
+    ImGui::Spacing();
+    ImGui::Checkbox("Show event areas", &showEventAreas);
+    if (ImGui::CollapsingHeader("Events")) {
+        DrawEventsEditor(ActiveScene.events, ContentWidth, /*live=*/true);
+        ImGui::Spacing();
+        ImGui::Checkbox("Place by click", &placeEventArmed);
+        if (placeEventArmed) {
+            ImGui::TextDisabled("Click in the sim to create an event there,\nusing the settings below (starts now).");
+            DrawEventFields(placeEventTemplate, ContentWidth);
+        }
+    }
+
     ImGui::End();
+
+    // After End() so WantCaptureMouse reflects this frame's panels: a click on the overlay itself
+    // must not also drop an event underneath it.
+    if (placeEventArmed && ImGui::IsMouseClicked(ImGuiMouseButton_Left) && !io.WantCaptureMouse) {
+        // Window center is the world origin, +y up, 1 world unit = 1 framebuffer pixel (see
+        // circle.vert); the camera-follow shift is display-only, so add it back for follow scenes.
+        const bool followCam = ActiveScene.boundary.periodicX && cameraFollow;
+        SceneEvent e = placeEventTemplate;
+        e.cx = (io.MousePos.x - io.DisplaySize.x * 0.5f) * io.DisplayFramebufferScale.x + (followCam ? cameraOffsetX : 0.f);
+        e.cy = -(io.MousePos.y - io.DisplaySize.y * 0.5f) * io.DisplayFramebufferScale.y;
+        e.startTime = static_cast<float>(simTime);
+        ActiveScene.events.push_back(e);
+        eventFired.resize(ActiveScene.events.size(), 0);
+    }
 }
 
 Object& CreateObject(float x, float y, Renderable r) {
@@ -1170,6 +1375,26 @@ static float WrapX(float x, float hw) {
     x = std::fmod(x + hw, span);
     if (x < 0.f) x += span;
     return x - hw;
+}
+
+// Live-view-only preview of each event's area (never drawn while recording, so it can't end up in
+// a video): translucent fill for circles, an outline for rects. Brighter once an event has
+// fired/is active, so it's visible when something is actually happening.
+static void DrawEventAreas(App& app) {
+    const float hw = ScreenHalfWidth();
+    const bool  followCam = ActiveScene.boundary.periodicX && cameraFollow;
+    const auto& events = ActiveScene.events;
+    for (size_t i = 0; i < events.size(); i++) {
+        const SceneEvent& e = events[i];
+        const bool active = e.mode == EventMode::Once
+            ? (i < eventFired.size() && eventFired[i])
+            : (simTime >= e.startTime && (e.duration <= 0.f || simTime < static_cast<double>(e.startTime) + e.duration));
+        const float a = active ? 0.45f : 0.18f;
+        const Color c = e.mode == EventMode::Once ? Color{ 1.0f, 0.55f, 0.1f, a } : Color{ 0.9f, 0.2f, 0.9f, a };
+        const float x = followCam ? WrapX(e.cx - cameraOffsetX, hw) : e.cx;
+        if (e.shape == EventShape::Circle) app.AddCircle(x, e.cy, e.radius, c);
+        else app.AddRectOutline(x, e.cy, e.halfW, e.halfH, 3.0f, { c.r, c.g, c.b, std::max(a, 0.5f) });
+    }
 }
 
 // Integrates a single substep, reusing whatever force (particle.acc) the last Update() call
@@ -1252,6 +1477,8 @@ static void DrawAndSubmitFrame(float dt, bool offscreen) {
         }
     }
     DrawBoundary(app);
+    if (!offscreen && showEventAreas && appState == AppState::Running && !app.IsRecording())
+        DrawEventAreas(app);
 
     // Batch rendering (see AdvanceRendering) never touches the swapchain/window at all — offscreen
     // draws+captures every frame unconditionally instead, so it can't be throttled by vsync or by
